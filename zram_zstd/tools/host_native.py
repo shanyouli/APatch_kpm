@@ -13,7 +13,11 @@ def native_source(module, source):
 
 
 def hook_frame(source, native_fixture=False):
-    source = source.replace('uint64_t arg0, arg1, ret;', 'uint64_t arg0, arg1, ret; int skip_origin;')
+    """为宿主夹具提供 SDK 四参数调用帧及 unwrap 桩，返回生成源码，不替换业务断言。"""
+    frame = ('typedef struct { void* chain; int skip_origin; uint64_t local[8]; uint64_t ret; '
+             'uint64_t arg0, arg1, arg2, arg3; } hook_fargs4_t;\n'
+             'typedef hook_fargs4_t hook_fargs2_t;')
+    source = source.replace('typedef struct { uint64_t arg0, arg1, ret; } hook_fargs2_t;', frame)
     stub = 'static void hook_unwrap(void* func, void* before, void* after);\n'
     if not native_fixture:
         stub = 'static void hook_unwrap(void* func, void* before, void* after) { __builtin_trap(); }\n'

@@ -6,9 +6,13 @@
 
 通过 `crypto_register_alg()` 依次注册 `zstd-kpm`、`lz4-kpm`、`lz4kd-kpm`；cra_name/driver_name相同。注册前使用 SDK `read_tcr(1)` 读取一次 `TCR_EL1.TG1` 并缓存为 `zs_page_size`：2/1/3 分别为 4096/16384/65536，保留编码 0 记为未知。仅缓存为 4096 时注册 LZ4KD；其它结果只跳过该项并记录日志，ZSTD/LZ4 的 Crypto 注册保持。缓存发布前完成赋值，随后两个前端只读，不在逐页路径重复检测。算法版本由加载日志及 `zstd_version` / `lz4_version` / `lz4kd_version` 元信息记录。现有 zram 继续管理压缩页与 CPU 压缩流。模块不改变已经初始化的 zram，也不修改交换空间配置。
 
-嵌入事件使用 `post-kernel-init`，先完成原生初始化，再在 Android 用户空间配置 zram 前注册。`pre-kernel-init` 在任何 Crypto API 调用前拒绝：算法查询可能触发模块请求和原生测试，不能当作单纯只读表查询。
+嵌入事件优先使用 `post-kernel-init`，先完成原生初始化，再在 Android 用户空间配置 zram 前注册。1.3.1 同时接受真正的 `pre-kernel-init` 嵌入：此时仅查找 `kernel_init` 并用 KP `hook_wrap(..., 4, ...)` 在既有 before 链执行期间串行追加 after 回调，返回 0 表示等待，不表示算法可用。早期不调用任何 Crypto API、不执行库自检、不分配编解码工作区；算法查询可能触发模块请求和原生测试，不能当作单纯只读表查询。查找或 hook 安装失败时返回原错误，尚未公开模块资源。
 
-检测到上述任一名字已有算法时，以 `-EEXIST` 结束加载，尚未发布任何模块资源。手动加载仅验证模块接入，不证明开机配置已选择 ZSTD。
+延迟回调在原生 `kernel_init` 正常返回后、用户空间开始配置 zram 前执行，共用普通加载的完整初始化流程。使用原子状态保证只执行一次；原函数被跳过或返回非零时以 `-ECANCELED` 标记失败，不注册算法，不改变原返回值。不得通过 `KPM_EVENT` 的 RCU 读侧通知回调直接执行可睡眠初始化，也不猜工作队列结构体布局。早期 hook 一经成功便常驻；晚期失败只记录 `deferred init=<错误>` 与失败状态，不热卸载或自动重试。等待期间普通初始化入口返回 `-EBUSY`；伪造/迟到的 pre 事件不作为支持范围。执行机制须核对目标 KP 的 hook 链行为及早期后缀查找条件，不能凭版本号推定。
+
+新增 `python3 tools/test_deferred.py --output ../local/<新目录>` 使用当前生产启动控制和实际 KP `_transit4` / `hook_chain_add`，覆盖 before 中追加 after、单次/并发激活、缺锚点/满链、原函数跳过/失败、晚期失败和常驻。该测试只需要已有本地 clang，不拉取资源；激活函数是模型，完整 Crypto/codec/原生 CFI 回归仍由原测试负责。原有三处 pre 拒绝断言改为明确的“缺少 kernel_init 返回 -ENOENT”，不缩小算法查询、注册或页粒度的零操作检查；契约变更须在开发报告单列并由 Auditor 复核。
+
+检测到上述任一名字已有算法时，普通初始化以 `-EEXIST` 结束，尚未发布算法资源；早期已成功安装 hook 的实例则保持常驻，并在晚期记录失败。手动加载仅验证模块接入，不证明开机配置已选择 ZSTD。
 
 `cra_module` 保持 NULL。KPM 的模块对象与原生 LKM 不同，不能填入该字段；使用内置算法的引用语义，模块必须常驻。注册链表本身就持有模块存储，不能仅看当前是否有压缩操作判断可卸载。当前 KP 的退出返回值无法阻止释放，仅给出不可卸载提醒。
 
@@ -200,7 +204,7 @@ Makefile默认只生成dynamic/static两种实际偏移模式，不生成单独d
 
 ### 嵌入方式
 
-把 KPM 嵌入启动镜像，加载事件选 `post-kernel-init`，参数留空，使模块在系统配置 zram 前注册算法。本模块拒绝 `pre-kernel-init`，返回 `-EINVAL`。
+把 KPM 嵌入启动镜像，加载事件优先选 `post-kernel-init`，参数留空，使模块在系统配置 zram 前注册算法。1.3.1 也兼容默认的 `pre-kernel-init`：先等待，随后由 `kernel_init` after hook 完成初始化；必须看到 `deferred init=0` 及算法注册成功，不能只看早期 `rc=0`。hook 安装成功后，即使仍在等待或晚期失败也不要热卸载。
 
 ### 安装方式
 
@@ -232,6 +236,7 @@ Makefile默认只生成dynamic/static两种实际偏移模式，不生成单独d
 
 ## 遇到问题
 
+- 早期 `rc=0` 配合 `waiting for kernel_init return` 只表示等待；`deferred init=0` 才表示晚期初始化完成，非零则保留现场日志，不重试、不热卸载。
 - 日志中`registration: ...=1`表示该名字注册成功，`=0`表示不可用；再检查zram选中的主名。
 - 名字已存在时模块拒绝重复加载；不要热卸载或另加载一份来换版。
 - 列表显示 hook 未接入时，可在初始化前直接写入已注册稳定名。

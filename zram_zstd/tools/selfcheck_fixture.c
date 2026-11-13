@@ -269,7 +269,8 @@ int main(int argc, char** argv) {
   assert(calculate_offsets() == 0);
   puts("PASS: BTF absence fallback, native error preservation, 64/128 names, layout rejection, missing short anchor");
   registration_mode = 1; btf_mode = 1; host_layout(128);
-  assert(zram_zstd_init("", "pre-kernel-init", NULL) == -EINVAL && algorithm_queries == 0);
+  // 此夹具缺少 kernel_init，不能把早期等待当作无条件成功。
+  assert(zram_zstd_init("", "pre-kernel-init", NULL) == -ENOENT && algorithm_queries == 0);
   query_index = 0;
   has_own_algorithm = 1;
   assert(zram_zstd_init("", "post-kernel-init", NULL) == -EEXIST && registration_count == 0);

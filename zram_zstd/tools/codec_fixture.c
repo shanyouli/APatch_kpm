@@ -95,7 +95,8 @@ static void reset_registration(void) {
 }
 static void registration_tests(void) {
   reset_registration();
-  assert(zram_zstd_init("", "pre-kernel-init", NULL) == -EINVAL && !query_count && !calls);
+  // 此夹具未提供 kernel_init：延迟接入必须拒绝，仍不得查询算法或注册。
+  assert(zram_zstd_init("", "pre-kernel-init", NULL) == -ENOENT && !query_count && !calls);
   for (int i = 0; i < 3; i++) {
     reset_registration();
     conflicts = i;

@@ -46,7 +46,8 @@ static void page_size_tests(void) {
   assert(zram_zstd_init("", "post-kernel-init", NULL) == -EEXIST);
   assert(query_count == 3 && !calls && !registered && !page_tcr_reads);
   reset_registration();
-  assert(zram_zstd_init("", "pre-kernel-init", NULL) == -EINVAL && !page_tcr_reads);
+  // 未提供延迟 hook 锚点时拒载；页粒度仍不能在早期读取。
+  assert(zram_zstd_init("", "pre-kernel-init", NULL) == -ENOENT && !page_tcr_reads);
   assert(allocations == frees);
   puts(
       "PASS: TG1 4/16/64 KiB/reserved, TG0 isolation, one pre-registration read, shared cache, lists and all partial "

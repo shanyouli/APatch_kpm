@@ -21,7 +21,7 @@ KPM_INFO(zstd_version, "1.5.7", 16);
 KPM_INFO(lz4_version, LZ4_VERSION_STRING, 16);
 KPM_INFO(lz4kd_version, "2022.03.20", 16);
 KPM_AUTHOR("lzghzr");
-KPM_DESCRIPTION("ZSTD, LZ4 and LZ4KD for zram. Embed for boot use; DO NOT UNLOAD.");
+KPM_DESCRIPTION("ZSTD, LZ4 and LZ4KD for zram. Deferred boot initialization; DO NOT UNLOAD.");
 #ifdef CONFIG_KPM_BASELINES
 KPM_INFO(offset_mode, "static", 16);
 #else
@@ -43,6 +43,11 @@ static unsigned char zstd_alg[1024] __attribute__((aligned(128)));
 static unsigned char lz4_alg[1024] __attribute__((aligned(128)));
 static unsigned char lz4kd_alg[1024] __attribute__((aligned(128)));
 static bool registered;
+// 仅跟踪早期嵌入路径；普通加载仍沿用 Crypto API 的名字冲突检查。
+enum zs_deferred_state { ZS_DEFER_IDLE, ZS_DEFER_WAITING, ZS_DEFER_INITIALIZING, ZS_DEFER_READY, ZS_DEFER_FAILED };
+static int deferred_state;
+static long deferred_error;
+static bool deferred_hook_installed;
 // 注册前取得一次；0 表示页大小未确认，两个前端只读取此缓存。
 static unsigned int zs_page_size;
 #define ZS_CODEC_COUNT 3
@@ -252,11 +257,8 @@ static unsigned int zs_detect_page_size(void) {
   return tg1 == 2 ? 4096U : tg1 == 1 ? 16384U : tg1 == 3 ? 65536U : 0;
 }
 
-static long zram_zstd_init(const char* args, const char* event, void* reserved) {
-  if (event && !strcmp(event, "pre-kernel-init")) {
-    logkm("use post-kernel-init\n");
-    return -EINVAL;
-  }
+/* 完成库自检和 Crypto 注册；无参数，返回初始化结果，只能在允许睡眠的上下文执行。 */
+static long zram_zstd_activate(void) {
   kfunc_lookup_name(crypto_has_alg);
   if (!kfunc(crypto_has_alg))
     return -ENOENT;
@@ -318,6 +320,53 @@ static long zram_zstd_init(const char* args, const char* event, void* reserved) 
   return 0;
 }
 
+/* kernel_init 的 after 回调：args 是原始调用帧，udata 不使用；不改原返回值。
+ * 此接入点由 KP 的普通 hook 链调用，不在模块事件通知的 RCU 读侧内；只允许一个调用者激活。
+ * hook 成功后始终常驻，即使晚期初始化失败，也不能让加载器释放仍被链表引用的代码。
+ */
+static void zram_zstd_after_kernel_init(hook_fargs4_t* args, void* udata) {
+  int expected = ZS_DEFER_WAITING;
+  if (!__atomic_compare_exchange_n(&deferred_state, &expected, ZS_DEFER_INITIALIZING, false, __ATOMIC_ACQ_REL,
+                                   __ATOMIC_ACQUIRE))
+    return;
+  long rc = args->skip_origin || args->ret ? -ECANCELED : zram_zstd_activate();
+  __atomic_store_n(&deferred_error, rc, __ATOMIC_RELEASE);
+  __atomic_store_n(&deferred_state, rc ? ZS_DEFER_FAILED : ZS_DEFER_READY, __ATOMIC_RELEASE);
+  logkm("deferred init=%ld after kernel_init; DO NOT UNLOAD\n", rc);
+}
+
+/* 在真正的 pre-kernel-init 嵌入阶段追加返回后回调；无参数，成功表示等待而非算法已注册。
+ * 该阶段在 kernel_init 的 before 链中串行执行，追加完成后原函数才开始；不调用 Crypto 或库分配器。
+ * 查找/安装失败时尚未公开模块资源，返回错误并允许加载器释放本实例。
+ */
+static long zram_zstd_defer(void) {
+  int expected = ZS_DEFER_IDLE;
+  if (!__atomic_compare_exchange_n(&deferred_state, &expected, ZS_DEFER_WAITING, false, __ATOMIC_ACQ_REL,
+                                   __ATOMIC_ACQUIRE))
+    return -EBUSY;
+  void* target = (void*)kallsyms_lookup_name_by_suffix("kernel_init");
+  long rc = target ? hook_wrap(target, 4, NULL, zram_zstd_after_kernel_init, NULL) : -ENOENT;
+  if (rc) {
+    __atomic_store_n(&deferred_state, ZS_DEFER_IDLE, __ATOMIC_RELEASE);
+    logkm("deferred hook unavailable: %ld\n", rc);
+    return rc;
+  }
+  deferred_hook_installed = true;
+  logkm("waiting for kernel_init return; algorithms not registered yet; DO NOT UNLOAD\n");
+  return 0;
+}
+
+/* KPM 加载入口：args/reserved 沿用接口但不消费；event 决定早期等待或普通初始化。
+ * 返回 0 可能仅表示等待，必须以最终注册日志与 /proc/crypto 判定激活；等待实例不能另行初始化。
+ */
+static long zram_zstd_init(const char* args, const char* event, void* reserved) {
+  if (event && !strcmp(event, "pre-kernel-init"))
+    return zram_zstd_defer();
+  if (__atomic_load_n(&deferred_state, __ATOMIC_ACQUIRE) != ZS_DEFER_IDLE)
+    return -EBUSY;
+  return zram_zstd_activate();
+}
+
 static long zram_zstd_ctl0(const char* args, char __user* out_msg, int outlen) {
   static const char reply[] = "_(._.)_";
   if (!out_msg || outlen < (int)sizeof(reply))
@@ -325,9 +374,12 @@ static long zram_zstd_ctl0(const char* args, char __user* out_msg, int outlen) {
   return compat_copy_to_user(out_msg, reply, sizeof(reply)) == sizeof(reply) ? 0 : -EFAULT;
 }
 
+/* 退出接口只记录常驻警告；reserved 不使用，返回 0 不表示允许热卸载。
+ * 已发布的 Crypto 回调或早期 hook 均持有模块字节，本入口不注销、不撤回在途回调。
+ */
 static long zram_zstd_exit(void* reserved) {
-  if (registered)
-    logkm("DO NOT UNLOAD: zram may retain codec callbacks\n");
+  if (registered || deferred_hook_installed)
+    logkm("DO NOT UNLOAD: crypto or boot hook may retain module callbacks\n");
   return 0;
 }
 
