@@ -18,16 +18,18 @@
 
 #include "../kpm_utils.h"
 #include "cfv2_utils.h"
+#include "cfv2_setup.h"
 
 KPM_NAME("cgroupv2_freeze");
 KPM_VERSION(MYKPM_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("lzghzr");
-KPM_DESCRIPTION("add cgroup.freeze, support 4.4 ~ 4.19");
+KPM_DESCRIPTION("add cgroup.freeze with native cgroup registration");
 
 #define GLOBAL_SYSTEM_UID KUIDT_INIT(1000)
 #define GLOBAL_SYSTEM_GID KGIDT_INIT(1000)
 
+// IZERO 表示已识别新形态；UZERO 是既有旧形态分支，不作为偏移值使用。
 #define IZERO (1UL << 0x10)
 #define UZERO (1UL << 0x20)
 
@@ -39,6 +41,9 @@ static int (*proc_pid_wchan)(struct seq_file* m, struct pid_namespace* ns, struc
 void kfunc_def(schedule)(void);
 // cgroup_freeze_task
 static void (*signal_wake_up_state)(struct task_struct* t, unsigned int state);
+struct sighand_struct;
+static struct sighand_struct* (*cfv2_lock_sighand)(struct task_struct* task, unsigned long* flags);
+static void (*cfv2_unlock_sighand)(raw_spinlock_t* lock, unsigned long flags);
 int kfunc_def(wake_up_process)(struct task_struct* p);
 // cgroup_do_freeze
 static void (*css_task_iter_start)(struct cgroup_subsys_state* css, unsigned int flags, struct css_task_iter* it);
@@ -80,16 +85,30 @@ static ssize_t (*kernfs_setattr)(struct kernfs_node* kn, const struct iattr* iat
 // hook get_signal
 static bool (*get_signal)(struct ksignal* ksig);
 
-struct struct_offset struct_offset = {};
+/* init 失败也会进入 exit；只记录并撤销本模块实际安装的回调。 */
+static bool get_signal_hooked, proc_pid_wchan_hooked, cgroup_addrm_files_hooked, cgroup_procs_write_hooked,
+    css_set_move_task_hooked, __kernfs_create_file_hooked, do_filp_open_hooked;
+static long inline_hook_exit(void* __user reserved);
+
+struct struct_offset struct_offset = {
+    .task_struct_state = -1, .css_set_dfl_cgrp = -1, .cgroup_kn = -1, .css_flags = -1, .sighand_siglock = -1};
+static struct css_set* cfv2_init_css_set;
+static struct cftype* cfv2_base_files;
 static uint64_t css_task_iter_start_ver5 = UZERO, cgroup_kn_lock_live_ver5 = UZERO, cftype_ver5 = UZERO,
                 cgroup_base_files_ver5 = UZERO;
 #include "cfv2_offsets.c"
 
-// 为待冻结的 task 以及 cgroup 添加必要的标志
+/* 设置任务冻结请求。task 为迭代器持有的任务，freeze 为目标状态；无返回值。
+ * 原生 lock_task_sighand 提供任务退出保护与 siglock；jobctl 修改和唤醒都在
+ * 该锁内完成。内核线程和已退出任务不处理，不用模块锁替代原生锁。
+ */
 static void cgroup_freeze_task(struct task_struct* task, bool freeze) {
-  if (!task)
+  if (!task || (task_flags(task) & PF_KTHREAD))
     return;
-
+  unsigned long irq_flags;
+  struct sighand_struct* sighand = cfv2_lock_sighand(task, &irq_flags);
+  if (!sighand)
+    return;
   unsigned long* jobctl = task_jobctl_ptr(task);
   if (freeze) {
     *jobctl |= JOBCTL_TRAP_FREEZE;
@@ -98,6 +117,7 @@ static void cgroup_freeze_task(struct task_struct* task, bool freeze) {
     *jobctl &= ~JOBCTL_TRAP_FREEZE;
     kfunc(wake_up_process)(task);
   }
+  cfv2_unlock_sighand((raw_spinlock_t*)((uintptr_t)sighand + struct_offset.sighand_siglock), irq_flags);
 }
 
 static void cgroup_do_freeze(struct cgroup* cgrp, bool freeze) {
@@ -195,14 +215,7 @@ static struct cftype cgroup_freeze_files[] = {
     {},
 };
 
-static void cgroup_addrm_files_after(hook_fargs4_t* args, void* udata) {
-  int ret = (int)args->ret;
-  if (ret)
-    return;
-
-  ((typeof(cgroup_addrm_files))wrap_get_origin_func(args))(
-      (struct cgroup_subsys_state*)args->arg0, (struct cgroup*)args->arg1, cgroup_freeze_files, (bool)args->arg3);
-}
+#include "cfv2_registration.c"
 
 static const char uid_[] = "uid_";
 static const char uid_0[] = "uid_0";
@@ -256,10 +269,8 @@ static void css_set_move_task_after(hook_fargs4_t* args, void* udata) {
   }
 
   if (!from_cset && to_cset) {
-    if (test_bit(CGRP_FREEZE, to_flags)) {
-      unsigned long* jobctl = task_jobctl_ptr(task);
-      *jobctl |= JOBCTL_TRAP_FREEZE;
-    }
+    if (test_bit(CGRP_FREEZE, to_flags))
+      cgroup_freeze_task(task, true);
   } else if (from_cset && to_cset) {
     if (test_bit(CGRP_FREEZE, from_flags) != test_bit(CGRP_FREEZE, to_flags)) {
       cgroup_freeze_task(task, test_bit(CGRP_FREEZE, to_flags));
@@ -290,34 +301,43 @@ static inline int signal_group_exit(struct signal_struct* sig) {
   return (flags & SIGNAL_GROUP_EXIT) || (group_exit_task != NULL);
 }
 
+/* get_signal 已处理完当前信号后执行一次冻结等待；无参数和返回值。
+ * 在 siglock 下关闭入睡与信号到达之间的竞态，保留挂起信号交给原生处理。
+ * 醒来仍被冻结时通过原生唤醒接口重新置 pending，让返回用户态路径再次
+ * 调用 get_signal；不在模块内部绕过原生 SIGKILL/停止信号处理无限循环。
+ */
 static void do_freezer_trap(void) {
-  unsigned long jobctl = task_jobctl(current);
-  if ((jobctl & (JOBCTL_PENDING_MASK | JOBCTL_TRAP_FREEZE)) != JOBCTL_TRAP_FREEZE)
+  unsigned long irq_flags;
+  struct sighand_struct* sighand = cfv2_lock_sighand(current, &irq_flags);
+  if (!sighand)
     return;
-
-  volatile long* state = task_state_ptr(current);
-  unsigned int* flags = task_flags_ptr(current);
-
-  *state = TASK_INTERRUPTIBLE;
-  clear_thread_flag(TIF_SIGPENDING);
-  *flags |= PF_FREEZER_SKIP;
+  unsigned long jobctl = task_jobctl(current);
+  if ((jobctl & (JOBCTL_PENDING_MASK | JOBCTL_TRAP_FREEZE)) != JOBCTL_TRAP_FREEZE
+      || signal_group_exit(task_signal(current))
+      || test_bit(TIF_SIGPENDING, (unsigned long*)&current_thread_info()->flags)) {
+    cfv2_unlock_sighand((raw_spinlock_t*)((uintptr_t)sighand + struct_offset.sighand_siglock), irq_flags);
+    return;
+  }
+  *task_state_ptr(current) = TASK_INTERRUPTIBLE;
+  *task_flags_ptr(current) |= PF_FREEZER_SKIP;
+  cfv2_unlock_sighand((raw_spinlock_t*)((uintptr_t)sighand + struct_offset.sighand_siglock), irq_flags);
   kfunc(schedule)();
-  *flags &= ~PF_FREEZER_SKIP;
+  *task_flags_ptr(current) &= ~PF_FREEZER_SKIP;
+
+  sighand = cfv2_lock_sighand(current, &irq_flags);
+  if (!sighand)
+    return;
+  if (task_jobctl(current) & JOBCTL_TRAP_FREEZE)
+    signal_wake_up_state(current, 0);
+  cfv2_unlock_sighand((raw_spinlock_t*)((uintptr_t)sighand + struct_offset.sighand_siglock), irq_flags);
 }
 
-static void get_signal_before(hook_fargs1_t* args, void* udata) {
-  struct signal_struct* signal = task_signal(current);
-  unsigned long* jobctl = task_jobctl_ptr(current);
-  for (;;) {
-    if (signal_group_exit(signal))
-      return;
-
-    if (unlikely(*jobctl & JOBCTL_TRAP_FREEZE)) {
-      do_freezer_trap();
-    } else {
-      return;
-    }
-  }
+/* args 为 get_signal 的返回现场；udata 未使用，无返回值。
+ * 只有原函数没有选出信号时才等待，避免冻结逻辑遮蔽待处理的致命信号。
+ */
+static void get_signal_after(hook_fargs1_t* args, void* udata) {
+  if (!args->ret && (task_jobctl(current) & JOBCTL_TRAP_FREEZE))
+    do_freezer_trap();
 }
 // kpm 模块 wchan 函数名总为0, 需要手动修改
 static void proc_pid_wchan_before(hook_fargs4_t* args, void* udata) {
@@ -333,125 +353,127 @@ static void proc_pid_wchan_before(hook_fargs4_t* args, void* udata) {
   }
 }
 
+/* 临时恢复真实 UMH 路径。args 为本次 exec 参数，udata 未使用；无返回值。
+ * 只在 argv[0] 有效时改写 path；调用者负责配对撤销回调。
+ */
 static void call_usermodehelper_exec_before(hook_fargs2_t* args, void* udata) {
   struct subprocess_info* sub_info = (struct subprocess_info*)args->arg0;
   if (!sub_info)
     return;
 
   char** argv = subprocess_info_argv(sub_info);
+  if (!argv || !argv[0])
+    return;
   *(char**)((uintptr_t)sub_info + struct_offset.subprocess_info_path) = argv[0];
 }
 
-static void run_cmd(char* cmd[]) {
-  char* envp[] = {"HOME=/", "PATH=/sbin:/bin", NULL};
-  bool sel = true;
-  hook_err_t err = 0;
+/* 执行以 NULL 结尾的命令数组 cmd；返回首个非零 UMH/进程状态，成功返回 0。
+ * 仅用于既有延迟初始化路径，可睡眠；保留旧实现临时切换 SELinux 的副作用。
+ * 临时 hook 安装失败不改 SELinux；执行结束恢复状态，只撤销本模块的回调。
+ */
+static int run_cmd(char* cmd[]) {
+  char* envp[] = {"HOME=/", "PATH=/system/bin:/system/xbin:/vendor/bin:/sbin:/bin", NULL};
+  bool sel;
+  int rc = 0;
 
   if (selinux_enforcing) {
     sel = *selinux_enforcing;
     *selinux_enforcing = false;
   } else {
-    err = hook_wrap2(kf_call_usermodehelper_exec, call_usermodehelper_exec_before, NULL, NULL);
+    hook_err_t err = hook_wrap2(kfunc(call_usermodehelper_exec), call_usermodehelper_exec_before, NULL, NULL);
+    if (err) {
+      logkm("temporary UMH hook failed: %d\n", err);
+      return -EINVAL;
+    }
     sel = selinux_state->enforcing;
     selinux_state->enforcing = false;
   }
 
   for (int i = 0; cmd[i]; i++) {
-    char* argv[] = {"/bin/sh", "-c", cmd[i], NULL};
-    call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+    char* argv[] = {"/system/bin/sh", "-c", cmd[i], NULL};
+    rc = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+    if (rc)
+      break;
   }
 
   if (selinux_enforcing) {
     *selinux_enforcing = sel;
   } else {
-    if (!err) {
-      unhook(kf_call_usermodehelper_exec);
-    }
     selinux_state->enforcing = sel;
+    hook_unwrap(kfunc(call_usermodehelper_exec), call_usermodehelper_exec_before, NULL);
   }
+  return rc;
 }
 
 static const char apm[] = "/data/adb/modules/";
+/* 在第一次模块目录打开后运行初始化命令。args 为打开参数，udata 未使用。
+ * 无返回值；先移除本回调避免 UMH 路径递归触发，失败只报告，不自动重试。
+ */
 static void do_filp_open_after(hook_fargs3_t* args, void* udata) {
   struct filename* pathname = (struct filename*)args->arg1;
-  if (!memcmp(pathname->name, apm, sizeof(apm) - 1)) {
-    char* cmd[] = {
-        "if [ ! -d \"/sys/fs/cgroup/uid_0\" ]; then\
-  umount /sys/fs/cgroup/freezer;\
-  umount /sys/fs/cgroup;\
-\
-  chown system:system /sys/fs/cgroup/;\
-\
-  if [ -d \"/dev/cg2_bpf/uid_0\" ]; then\
-    mount -t cgroup2 none /sys/fs/cgroup/;\
-  elif [ -d \"/acct/uid_0\" ]; then\
-    mount -t cgroup -o cpuacct none /sys/fs/cgroup/;\
-  else\
-    exit;\
-  fi;\
-fi;\
-\
-if [ ! -d \"/sys/fs/cgroup/frozen\" ]; then\
-  mkdir /sys/fs/cgroup/frozen/;\
-  chown -R system:system /sys/fs/cgroup/frozen/;\
-  echo 1 > /sys/fs/cgroup/frozen/cgroup.freeze;\
-\
-  mkdir /sys/fs/cgroup/unfrozen/;\
-  chown -R system:system /sys/fs/cgroup/unfrozen/;\
-fi",
-        NULL};
-    run_cmd(cmd);
-    unhook_func(do_filp_open);
-  }
+  if (!pathname || !pathname->name || strncmp(pathname->name, apm, sizeof(apm) - 1))
+    return;
+
+  do_filp_open_hooked = false;
+  hook_unwrap(do_filp_open, NULL, do_filp_open_after);
+  char* cmd[] = {(char*)cfv2_setup_cmd, NULL};
+  int rc = run_cmd(cmd);
+  if (rc)
+    logkm("cgroup setup failed: %d (existing groups may lack cgroup.freeze)\n", rc);
 }
 
+/* 初始化模块依赖、偏移与 hook。args/reserved 保留，event 控制既有延迟加载。
+ * 成功返回 0；符号、偏移或 hook 失败返回负值，不将自检结果视为设备兼容结论。
+ */
 static long inline_hook_init(const char* args, const char* event, void* __user reserved) {
-  // 有 cgroup_freeze_write 函数说明本身就支持cgroupv2 freezer
-  void (*kf_cgroup_freeze_write)(void);
-  kf_cgroup_freeze_write = (typeof(kf_cgroup_freeze_write))kallsyms_lookup_name("cgroup_freeze_write");
-  if (kf_cgroup_freeze_write)
+  // 原生 freezer 的函数也可能有编译器后缀。
+  if (kallsyms_lookup_name_by_suffix("cgroup_freeze_write"))
     return -24;
 
-  lookup_name(do_filp_open);
-  lookup_name(proc_pid_wchan);
-  kfunc_lookup_name(schedule);
+  cfv2_lookup_name(do_filp_open);
+  cfv2_lookup_name(proc_pid_wchan);
+  cfv2_kfunc_lookup_name(schedule);
 
-  lookup_name(signal_wake_up_state);
-  kfunc_lookup_name(wake_up_process);
+  cfv2_lookup_name(signal_wake_up_state);
+  cfv2_lock_sighand = (typeof(cfv2_lock_sighand))kallsyms_lookup_name_by_suffix("__lock_task_sighand");
+  cfv2_unlock_sighand = (typeof(cfv2_unlock_sighand))kallsyms_lookup_name_by_suffix("_raw_spin_unlock_irqrestore");
+  if (!cfv2_lock_sighand || !cfv2_unlock_sighand)
+    return -ENOENT;
+  cfv2_kfunc_lookup_name(wake_up_process);
 
-  lookup_name(css_task_iter_start);
+  cfv2_lookup_name(css_task_iter_start);
   css_task_iter_start_v4 = (typeof(css_task_iter_start_v4))css_task_iter_start;
-  lookup_name(css_task_iter_next);
-  lookup_name(css_task_iter_end);
+  cfv2_lookup_name(css_task_iter_next);
+  cfv2_lookup_name(css_task_iter_end);
 
-  lookup_name(css_next_descendant_pre);
+  cfv2_lookup_name(css_next_descendant_pre);
 
-  kfunc_lookup_name(of_css);
-  kfunc_lookup_name(seq_printf);
+  cfv2_kfunc_lookup_name(of_css);
+  cfv2_kfunc_lookup_name(seq_printf);
 
-  lookup_name(cgroup_kn_lock_live);
+  cfv2_lookup_name(cgroup_kn_lock_live);
   cgroup_kn_lock_live_v4 = (typeof(cgroup_kn_lock_live_v4))cgroup_kn_lock_live;
-  lookup_name(cgroup_kn_unlock);
-  kfunc_lookup_name(kstrtoint);
-  kfunc_lookup_name(strim);
+  cfv2_lookup_name(cgroup_kn_unlock);
+  cfv2_kfunc_lookup_name(kstrtoint);
+  cfv2_kfunc_lookup_name(strim);
 
-  kfunc_lookup_name(call_usermodehelper);
-  kfunc_lookup_name(call_usermodehelper_exec);
+  cfv2_kfunc_lookup_name(call_usermodehelper);
+  cfv2_kfunc_lookup_name(call_usermodehelper_exec);
 
-  selinux_enforcing = (typeof(selinux_enforcing))kallsyms_lookup_name("selinux_enforcing");
-  selinux_state = (typeof(selinux_state))kallsyms_lookup_name("selinux_state");
+  selinux_enforcing = (typeof(selinux_enforcing))kallsyms_lookup_name_by_suffix("selinux_enforcing");
+  selinux_state = (typeof(selinux_state))kallsyms_lookup_name_by_suffix("selinux_state");
   if (!selinux_enforcing && !selinux_state)
     return -21;
 
-  lookup_name(cgroup_addrm_files);
-  lookup_name(cgroup_init_cftypes);
+  cfv2_lookup_name(cgroup_addrm_files);
+  cfv2_lookup_name(cgroup_init_cftypes);
 
-  lookup_name(cgroup_procs_write);
-  lookup_name(css_set_move_task);
-  lookup_name(__kernfs_create_file);
-  lookup_name(kernfs_setattr);
+  cfv2_lookup_name(cgroup_procs_write);
+  cfv2_lookup_name(css_set_move_task);
+  cfv2_lookup_name(__kernfs_create_file);
+  cfv2_lookup_name(kernfs_setattr);
 
-  lookup_name(get_signal);
+  cfv2_lookup_name(get_signal);
 
   int rc = 0;
   rc = calculate_offsets();
@@ -465,42 +487,59 @@ static long inline_hook_init(const char* args, const char* event, void* __user r
     cgroup_freeze_files->seq_show_v4 = cgroup_freeze_show;
     cgroup_freeze_files->write_v4 = cgroup_freeze_write;
   }
+  rc = cfv2_resolve_registration();
+  if (rc)
+    return rc;
   rc = cgroup_init_cftypes(NULL, cgroup_freeze_files);
   if (rc < 0)
     return rc;
 
-  hook_func(get_signal, 1, get_signal_before, NULL, NULL);
-  hook_func(proc_pid_wchan, 4, proc_pid_wchan_before, NULL, NULL);
-  hook_func(cgroup_addrm_files, 4, NULL, cgroup_addrm_files_after, NULL);
-  hook_func(cgroup_procs_write, 4, NULL, cgroup_procs_write_after, NULL);
-  hook_func(css_set_move_task, 4, NULL, css_set_move_task_after, NULL);
+  cfv2_hook_func(get_signal, 1, NULL, get_signal_after, NULL);
+  cfv2_hook_func(proc_pid_wchan, 4, proc_pid_wchan_before, NULL, NULL);
+  cfv2_hook_func(cgroup_addrm_files, 4, NULL, cgroup_addrm_files_after, NULL);
+  cfv2_hook_func(cgroup_procs_write, 4, NULL, cgroup_procs_write_after, NULL);
+  cfv2_hook_func(css_set_move_task, 4, NULL, css_set_move_task_after, NULL);
   // 高版本内核会自动处理所有者, 不再需要手动更改
   if (cgroup_base_files_ver5 != IZERO) {
-    hook_func(__kernfs_create_file, 8, NULL, __kernfs_create_file_after, NULL);
+    cfv2_hook_func(__kernfs_create_file, 8, NULL, __kernfs_create_file_after, NULL);
   }
 
   if (!event || strcmp(event, "load-file")) {
-    hook_func(do_filp_open, 3, NULL, do_filp_open_after, NULL);
+    cfv2_hook_func(do_filp_open, 3, NULL, do_filp_open_after, NULL);
   }
 
+  rc = cfv2_register_existing_groups();
+  if (rc)
+    goto fail_hooks;
   return 0;
+
+fail_hooks:
+  inline_hook_exit(NULL);
+  return rc;
 }
 
+/* 返回固定控制应答。ctl_args 未使用，out_msg/outlen 为用户缓冲区及容量。
+ * 只复制已初始化字节；缓冲区不足返回 -EINVAL，短拷贝返回 -EFAULT，否则返回 0。
+ */
 static long inline_hook_control0(const char* ctl_args, char* __user out_msg, int outlen) {
-  char msg[64];
-  snprintf(msg, sizeof(msg), "_(._.)_");
-  compat_copy_to_user(out_msg, msg, sizeof(msg));
-  return 0;
+  static const char msg[] = "_(._.)_";
+  if (!out_msg || outlen < (int)sizeof(msg))
+    return -EINVAL;
+  int copied = compat_copy_to_user(out_msg, msg, sizeof(msg));
+  return copied == (int)sizeof(msg) ? 0 : -EFAULT;
 }
 
+/* 撤销本模块已安装回调，reserved 未使用；返回 0，可重复处理部分初始化。
+ * 不调用全局 unhook，不宣称在途回调或已发布 cftype 的生命周期已得到验证。
+ */
 static long inline_hook_exit(void* __user reserved) {
-  unhook_func(get_signal);
-  unhook_func(proc_pid_wchan);
-  unhook_func(cgroup_addrm_files);
-  unhook_func(cgroup_procs_write);
-  unhook_func(css_set_move_task);
-  unhook_func(__kernfs_create_file);
-  unhook_func(do_filp_open);
+  cfv2_unhook_func(do_filp_open, NULL, do_filp_open_after);
+  cfv2_unhook_func(__kernfs_create_file, NULL, __kernfs_create_file_after);
+  cfv2_unhook_func(css_set_move_task, NULL, css_set_move_task_after);
+  cfv2_unhook_func(cgroup_procs_write, NULL, cgroup_procs_write_after);
+  cfv2_unhook_func(cgroup_addrm_files, NULL, cgroup_addrm_files_after);
+  cfv2_unhook_func(proc_pid_wchan, proc_pid_wchan_before, NULL);
+  cfv2_unhook_func(get_signal, NULL, get_signal_after);
 
   return 0;
 }

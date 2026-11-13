@@ -25,13 +25,14 @@ else ifdef NDK_PATH
     LD := $(NDK_PATH)/ld.lld
 endif
 
-CFLAGS = -Wall -O2 -fno-PIC -fno-asynchronous-unwind-tables -fno-stack-protector -fno-common -DMYKPM_VERSION=\"$(MYKPM_VERSION)$(MYKPM_VER)\"
+CFLAGS = -Wall -O2 -mgeneral-regs-only -ffixed-x18 -mno-outline-atomics -fno-builtin -fno-PIC -fno-asynchronous-unwind-tables -fno-stack-protector -fno-common -DMYKPM_VERSION=\"$(MYKPM_VERSION)$(MYKPM_VER)\"
 
 INCLUDE_DIRS := . include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include
 
 INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
 
 objs := cgroupv2_freeze.c
+deps := cgroupv2_freeze.h cfv2_utils.h cfv2_setup.h cfv2_offsets.c cfv2_registration.c ../kpm_utils.h
 
 all: base
 
@@ -41,11 +42,11 @@ debug: CFLAGS += -DCONFIG_DEBUG
 debug: MYKPM_VER := _d
 debug: cgroupv2_freeze_$(MYKPM_VERSION)_debug.kpm
 
-cgroupv2_freeze_$(MYKPM_VERSION).kpm: ${objs}
-	${CC} $(CFLAGS) $(CFLAG) $(INCLUDE_FLAGS) $^ -r -o $@
+cgroupv2_freeze_$(MYKPM_VERSION).kpm: ${objs} $(deps)
+	${CC} $(CFLAGS) $(CFLAG) $(INCLUDE_FLAGS) $(objs) -r -o $@
 
-cgroupv2_freeze_$(MYKPM_VERSION)_debug.kpm: ${objs}
-	${CC} $(CFLAGS) $(CFLAG) $(INCLUDE_FLAGS) $^ -r -o $@
+cgroupv2_freeze_$(MYKPM_VERSION)_debug.kpm: ${objs} $(deps)
+	${CC} $(CFLAGS) $(CFLAG) $(INCLUDE_FLAGS) $(objs) -r -o $@
 
 .PHONY: clean
 clean:
