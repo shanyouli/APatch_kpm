@@ -1118,6 +1118,10 @@ static bool nm_scalar_copy_step(uint32_t inst) {
   return false;
 }
 
+/* 在src的count条窗口内核对参数对象到destination的标量复制，size为LDR宽度编码。
+ * 仅允许已确认不改写参数的步骤；64位复制可间隔一条不覆盖参数/值寄存器的MOVZ。
+ * 成功返回源位移，未确认返回-ENOENT；不跟随分支，不写布局或解引用对象。
+ */
 static int nm_scalar_copy(const uint32_t* src, unsigned int count, int size, int destination) {
   if (inst_is_paciasp(src[0]))
     src++;
@@ -1125,6 +1129,13 @@ static int nm_scalar_copy(const uint32_t* src, unsigned int count, int size, int
     if (nm_load(src[i], size, 0) && nm_store(src[i + 1], size, 1) && inst_get_ldr_imm_rt(src[i]) != 1
         && inst_get_ldr_imm_rt(src[i]) == inst_get_str_imm_rt(src[i + 1])
         && inst_get_str_imm_imm(src[i + 1]) == destination)
+      return inst_get_ldr_imm_imm(src[i]);
+    if (size == 3 && i + 2 < count && nm_load(src[i], size, 0) && inst_get_ldr_imm_rt(src[i]) != 1
+        && inst_is_movz_imm(src[i + 1]) && inst_get_movz_imm_rd(src[i + 1]) != 0
+        && inst_get_movz_imm_rd(src[i + 1]) != 1
+        && inst_get_movz_imm_rd(src[i + 1]) != inst_get_ldr_imm_rt(src[i]) && nm_store(src[i + 2], size, 1)
+        && inst_get_str_imm_rt(src[i + 2]) == inst_get_ldr_imm_rt(src[i])
+        && inst_get_str_imm_imm(src[i + 2]) == destination)
       return inst_get_ldr_imm_imm(src[i]);
     if (!nm_scalar_copy_step(src[i]))
       break;
@@ -1495,11 +1506,106 @@ static int nm_probe_saved_inode_storage(const uint32_t* src, uintptr_t no_open,
   return -ENOENT;
 }
 
+/* 核对src的SUB栈帧初始化入口，固定19条止于原生i_fop写入。
+ * no_open或probe提供原表身份；data仅在成功时接收已核对fop/flctx后紧邻i_data的位置。
+ * 返回真实STR的i_fop位移；未知来源/表身份返回负错误，不扫描后续LSM调用。
+ */
+static int nm_probe_sub_inode_storage(const uint32_t* src, uintptr_t no_open,
+                                      const struct nm_initial_fops_probe* probe, int* data) {
+  if (inst_is_paciasp(src[0]))
+    src++;
+  if (!inst_is_sub_imm(src[0]) || !inst_get_sub_imm_sf(src[0]) || inst_get_sub_imm_rd(src[0]) != 31
+      || inst_get_sub_imm_rn(src[0]) != 31 || inst_get_sub_imm_imm(src[0]) != 64
+      || !nm_pair_store_at(src[1], 29, 30, 31, 16) || !nm_pair_store_at(src[2], 22, 21, 31, 32)
+      || !nm_pair_store_at(src[3], 20, 19, 31, 48) || !nm_add_at(src[4], 29, 31, 16)
+      || !nm_store_at(src[5], 3, 0, 1, struct_offset.inode_superblock) || !nm_load(src[6], 0, 0)
+      || inst_get_ldr_imm_rt(src[6]) != 8 || inst_get_ldr_imm_imm(src[6]) != offsetof(struct nm_super_head, s_blocksize_bits)
+      || !inst_is_movz_imm(src[7]) || inst_get_movz_imm_sf(src[7]) || inst_get_movz_imm_hw(src[7])
+      || inst_get_movz_imm_rd(src[7]) != 9 || inst_get_movz_imm_imm16(src[7]) != 1
+      || !nm_store_at(src[8], 2, 31, 1, offsetof(struct nm_inode_owner_prefix, i_flags))
+      || !inst_is_adrp(src[9]) || inst_get_adrp_rd(src[9]) != 20 || !nm_store(src[10], 2, 1)
+      || inst_get_str_imm_rt(src[10]) != 8 || !inst_is_adrp(src[11]) || inst_get_adrp_rd(src[11]) != 8
+      || !nm_add_at(src[12], 8, 8, inst_get_add_imm_imm(src[12])) || !nm_store(src[13], 3, 1)
+      || inst_get_str_imm_rt(src[13]) != 31 || !nm_store(src[14], 2, 1) || inst_get_str_imm_rt(src[14]) != 9
+      || !nm_store_at(src[15], 3, 8, 1, struct_offset.inode_superblock - 8)
+      || !inst_is_adrp(src[16]) || inst_get_adrp_rd(src[16]) != 8
+      || !nm_add_at(src[17], 8, 8, inst_get_add_imm_imm(src[17])) || !nm_store(src[18], 3, 1)
+      || inst_get_str_imm_rt(src[18]) != 8)
+    return -EOPNOTSUPP;
+  uintptr_t table = ((uintptr_t)&src[16] & ~(uintptr_t)4095) + inst_get_adrp_label(src[16])
+                    + inst_get_add_imm_imm(src[17]);
+  if (!(no_open ? table == no_open : nm_initial_fops_matches(table, probe)))
+    return -EOPNOTSUPP;
+  int offset = inst_get_str_imm_imm(src[18]);
+  if (offset <= struct_offset.inode_superblock || offset % 8 || offset > 0x7fff - sizeof(struct nm_inode_file_locks))
+    return -EINVAL;
+  *data = offset + sizeof(struct nm_inode_file_locks);
+  return offset;
+}
+
+/* 核对src所指完整compact address_space初始化，固定31条包含RET。
+ * 先验证整对象逐字零覆盖，再核对原声明的radix/rwsem/private list初始化；
+ * 不把最高单成员写入当sizeof。成功返回原声明尺寸，缺口/未知形态返回负错误。
+ */
+static int nm_find_compact_mapping_clear(const uint32_t* src) {
+  if (!nm_move(src[0], 8, 0) || !nm_move(src[1], 9, 0) || !inst_is_movz_imm(src[2])
+      || inst_get_movz_imm_sf(src[2]) || inst_get_movz_imm_rd(src[2]) != 10 || inst_get_movz_imm_hw(src[2]))
+    return -EOPNOTSUPP;
+  uint32_t covered = 0;
+  for (unsigned i = 3; i <= 11; i++) {
+    uint32_t inst = src[i];
+    if (!inst_is_stp(inst) || bit(inst, 26) || inst_get_stp_size(inst) != 2 || inst_get_stp_mode(inst) != 2
+        || inst_get_stp_rn(inst) != 0 || inst_get_stp_rt(inst) != 31 || inst_get_stp_rt2(inst) != 31)
+      return -EOPNOTSUPP;
+    int offset = inst_get_stp_imm(inst);
+    if (offset < 0 || offset % 8 || offset > 240)
+      return -EINVAL;
+    covered |= 3U << (offset / 8);
+  }
+  if (!inst_is_movk_imm(src[12]) || inst_get_movk_imm_sf(src[12]) || inst_get_movk_imm_rd(src[12]) != 10
+      || inst_get_movk_imm_hw(src[12]) != 1)
+    return -EOPNOTSUPP;
+  const unsigned offsets[] = {offsetof(struct nm_compact_address_space, private_next),
+                              offsetof(struct nm_compact_address_space, mmap_sem.wait_next)};
+  for (unsigned i = 0; i < 2; i++) {
+    uint32_t inst = src[13 + i];
+    if (!inst_is_str_imm9(inst) || bit(inst, 26) || inst_get_str_imm9_size(inst) != 3
+        || inst_get_str_imm9_mode(inst) != 3 || inst_get_str_imm9_rt(inst) != 31
+        || inst_get_str_imm9_rn(inst) != 8 + i || inst_get_str_imm9_imm9(inst) != offsets[i])
+      return -EOPNOTSUPP;
+    covered |= 1U << (offsets[i] / 8);
+  }
+  if (!nm_store_at(src[15], 3, 31, 0, offsetof(struct nm_compact_address_space, private_prev))
+      || !nm_store_at(src[16], 3, 31, 0, offsetof(struct nm_compact_address_space, host)))
+    return -EOPNOTSUPP;
+  covered |= (1U << (offsetof(struct nm_compact_address_space, private_prev) / 8)) | 1U;
+  if (covered != (1U << (sizeof(struct nm_compact_address_space) / 8)) - 1U
+      || !nm_store_at(src[17], 2, 10, 0, offsetof(struct nm_compact_address_space, page_tree.gfp_mask))
+      || !nm_store_at(src[18], 3, 31, 0, offsetof(struct nm_compact_address_space, page_tree.rnode))
+      || !nm_store_at(src[19], 2, 31, 0, offsetof(struct nm_compact_address_space, tree_lock))
+      || !nm_store_at(src[20], 3, 31, 0, offsetof(struct nm_compact_address_space, mmap_sem.count))
+      || !nm_store_at(src[21], 2, 31, 0, offsetof(struct nm_compact_address_space, mmap_sem.wait_lock))
+      || !nm_store_at(src[22], 3, 9, 9, 0)
+      || !nm_store_at(src[23], 3, 9, 0, offsetof(struct nm_compact_address_space, mmap_sem.wait_prev))
+      || !nm_pair_store_at(src[24], 31, 31, 0, offsetof(struct nm_compact_address_space, mmap_sem.owner))
+      || !nm_store_at(src[25], 2, 31, 0, offsetof(struct nm_compact_address_space, mmap_sem.osq))
+      || !nm_store_at(src[26], 3, 8, 8, 0)
+      || !nm_store_at(src[27], 3, 8, 0, offsetof(struct nm_compact_address_space, private_prev))
+      || !nm_store_at(src[28], 2, 31, 0, offsetof(struct nm_compact_address_space, private_lock))
+      || !nm_pair_store_at(src[29], 31, 31, 0, offsetof(struct nm_compact_address_space, mmap_root))
+      || !inst_is_ret(src[30]) || inst_get_ret_rn(src[30]) != 30)
+    return -EOPNOTSUPP;
+  return sizeof(struct nm_compact_address_space);
+}
+
 // 原生整对象memset的内联形态：验证连续零覆盖和随后的初始化，不把单个最高成员当sizeof。
 static int nm_find_mapping_clear_size(const uint32_t* src) {
   int size = nm_find_complete_object_size(src, 8, 0, kallsyms_lookup_name("memset"), 0, 8);
   if (size >= 0 || size == -EINVAL)
     return size;
+  int compact = nm_find_compact_mapping_clear(src);
+  if (compact >= 0 || compact == -EINVAL)
+    return compact;
   if (inst_is_paciasp(src[0])) {
     for (unsigned i = 1; i <= 4; i++)
       if (!nm_rule_entry_save(src[i]))
@@ -1561,6 +1667,10 @@ static int nm_find_mapping_clear_size(const uint32_t* src) {
   return 10 * 2 * sizeof(u64);
 }
 
+/* 无参数；从具名inode初始化器取得i_fop/i_data、完整mapping尺寸与blocks字段。
+ * 先核对原表身份，再匹配已确认初始化形态；成功写布局并返回0，失败返回负错误。
+ * 新SUB入口不延长旧21/20条扫描；完整清零未确认时仍拒绝。
+ */
 static int calculate_function_inode_offsets(void) {
   const uint32_t* clear = (const void*)kallsyms_lookup_name_by_suffix("address_space_init_once");
   const uint32_t* init = (const void*)kallsyms_lookup_name_by_suffix("inode_init_always");
@@ -1573,12 +1683,16 @@ static int calculate_function_inode_offsets(void) {
     return -ENOENT;
   }
   int data = -1, file_ops;
+  unsigned entry = inst_is_paciasp(init[0]) ? 1 : 0;
+  bool sub_frame = inst_is_sub_imm(init[entry]) && inst_get_sub_imm_sf(init[entry])
+                   && inst_get_sub_imm_rd(init[entry]) == 31 && inst_get_sub_imm_rn(init[entry]) == 31;
   bool saved_inode = inst_is_paciasp(init[0]) || nm_move(init[3], 19, 1)
                      || (!inst_is_str_imm9(init[0]) && nm_move(init[6], 19, 1))
                      || (inst_is_str_imm9(init[0]) && inst_is_adrp(init[6]) && inst_get_adrp_rd(init[6]) == 10);
   if (no_open) {
-    file_ops = saved_inode ? nm_probe_saved_inode_storage(init, no_open, NULL, &data)
-                           : nm_find_inode_storage(init, no_open, &data);
+    file_ops = sub_frame ? nm_probe_sub_inode_storage(init, no_open, NULL, &data)
+                        : saved_inode ? nm_probe_saved_inode_storage(init, no_open, NULL, &data)
+                                      : nm_find_inode_storage(init, no_open, &data);
   } else {
     struct nm_initial_fops_probe probe = {kallsyms_lookup_name_by_suffix("no_open"), kallsyms_lookup_name("_stext"),
                                           kallsyms_lookup_name("_etext"), kallsyms_lookup_name("_end")};
@@ -1596,8 +1710,9 @@ static int calculate_function_inode_offsets(void) {
         return -ENOENT;
       }
     }
-    file_ops = saved_inode ? nm_probe_saved_inode_storage(init, 0, &probe, &data)
-                           : nm_probe_inode_storage(init, 0, &probe, &data);
+    file_ops = sub_frame ? nm_probe_sub_inode_storage(init, 0, &probe, &data)
+                        : saved_inode ? nm_probe_saved_inode_storage(init, 0, &probe, &data)
+                                      : nm_probe_inode_storage(init, 0, &probe, &data);
     if (file_ops >= 0)
       nm_log_info("layout: inode initial file table identified by open callback\n");
   }
@@ -2133,6 +2248,10 @@ static int nm_find_key_preparse_data_legacy(const uint32_t* src) {
   return input;
 }
 
+/* 从src的user_preparse入口核对长度拒绝分支和data/datalen连续布局。
+ * 保留旧11/13条路径；新增同长度窗口内的limit/difference寄存器重排。
+ * 成功返回data位移，错误返回负状态，不进入分配或用户载荷访问。
+ */
 static int nm_find_key_preparse_data(const uint32_t* src) {
   int old = nm_find_key_preparse_data_legacy(src);
   if (old >= 0 || old == -EINVAL)
@@ -2188,8 +2307,9 @@ static int nm_find_key_preparse_data(const uint32_t* src) {
     data_at = 8;
     null_at = 10;
     length_reg = 19;
-    limit_reg = 8;
-    difference = 9;
+    bool reordered = inst_is_movz_imm(src[4]) && inst_get_movz_imm_rd(src[4]) == 9;
+    limit_reg = reordered ? 9 : 8;
+    difference = reordered ? 8 : 9;
     data_reg = 8;
     if (!nm_move(src[9], 20, 0))
       return -EOPNOTSUPP;
@@ -2306,8 +2426,10 @@ static int nm_check_key_name_legacy(const uint32_t* src, uintptr_t compare) {
   return 0;
 }
 
-// 返回注册遍历中的link起点，并标出首次锁调用、可见的class清零调用及其对象内起点。
-// 旧入口仍执行原判据；新入口分别限23/21条，不把未知指令当作无关prologue。
+/* 从src的注册遍历取得link，compare绑定strcmp；输出参数记录锁和class初始化调用。
+ * 成功返回真实link位移，失败返回负状态；新增19条无class清零入口，旧判据不变。
+ * 未看到class调用只输出-1，不从mutex或版本推测全局lockdep配置。
+ */
 static int nm_find_key_registration(const uint32_t* src, uintptr_t compare, int* lock_call, int* class_call,
                                     int* class_offset) {
   *class_call = *class_offset = -1;
@@ -2322,6 +2444,25 @@ static int nm_find_key_registration(const uint32_t* src, uintptr_t compare, int*
     }
     *lock_call = 9;
     return inst_get_sub_imm_imm(src[11]);
+  }
+  if (nm_move(src[5], 19, 0) && nm_page_address(&src[6], 0)) {
+    for (unsigned i = 0; i < 5; i++)
+      if (!nm_rule_entry_save(src[i]))
+        return -EOPNOTSUPP;
+    if (!inst_is_bl(src[8])
+        || !nm_code_matches((uintptr_t)&src[8] + inst_get_bl_label(src[8]), kallsyms_lookup_name_by_suffix("down_write"),
+                            kallsyms_lookup_name("_stext"), kallsyms_lookup_name("_etext"))
+        || !nm_page_address(&src[9], 22) || !nm_load_at(src[11], 20, 22, 0)
+        || !nm_compare(src[12], 20, 22) || !inst_is_b_cond(src[13]) || inst_get_b_cond_cond(src[13])
+        || inst_get_b_cond_label(src[13]) <= 20 || !nm_load_at(src[14], 21, 19, 0) || !nm_move(src[15], 23, 20)
+        || !nm_load_unscaled(src[16], 0, 23, inst_get_ldr_imm9_imm9(src[16]), 0) || !nm_move(src[17], 1, 21)
+        || !inst_is_bl(src[18]) || (uintptr_t)&src[18] + inst_get_bl_label(src[18]) != compare)
+      return -EOPNOTSUPP;
+    int link = -inst_get_ldr_imm9_imm9(src[16]);
+    if (link < NM_KEY_TYPE_PROBE_SIZE || link % 8 || link > 4096 - sizeof(struct nm_key_type_tail))
+      return -EINVAL;
+    *lock_call = 8;
+    return link;
   }
   // GCC：原始type在x24，name暂存在x21；链表容器x19的两次换算必须一致。
   if (inst_is_adrp(src[3]) && inst_get_adrp_rd(src[3]) == 22 && nm_move(src[7], 24, 0)) {
@@ -2463,11 +2604,37 @@ static int nm_find_key_callback_slot_legacy(const uint32_t* src) {
   return slot;
 }
 
-// 新入口从key实参一直核对到type->def_datalen与preparse；最多30条，旧窗口不扩大。
+/* 从src取得key->type->preparse槽，成功返回偏移，未知来源或几何返回负错误。
+ * 旧入口先执行；新增23条SUB/FP重排形态，止于首次回调读取，不执行preparse。
+ */
 static int nm_find_key_callback_slot(const uint32_t* src) {
   int slot = nm_find_key_callback_slot_legacy(src);
   if (slot >= 0 || slot == -EINVAL)
     return slot;
+  if (inst_is_sub_imm(src[0]) && nm_add_at(src[5], 29, 31, 96)) {
+    if (!inst_get_sub_imm_sf(src[0]) || inst_get_sub_imm_rd(src[0]) != 31 || inst_get_sub_imm_rn(src[0]) != 31
+        || inst_get_sub_imm_imm(src[0]) != 160 || !nm_pair_store_at(src[1], 29, 30, 31, 96)
+        || !nm_store_at(src[2], 3, 23, 31, 112) || !nm_pair_store_at(src[3], 22, 21, 31, 128)
+        || !nm_pair_store_at(src[4], 20, 19, 31, 144) || !inst_is_adrp(src[6]) || inst_get_adrp_rd(src[6]) != 8
+        || !nm_load(src[7], 3, 8) || inst_get_ldr_imm_rt(src[7]) != 8 || !nm_move(src[8], 19, 0)
+        || !nm_max_signed64(src[9], 10) || !nm_move(src[10], 20, 4))
+      return -EOPNOTSUPP;
+    uint32_t canary = src[11];
+    if (!inst_is_str_imm9(canary) || bit(canary, 26) || inst_get_str_imm9_size(canary) != 3
+        || inst_get_str_imm9_rt(canary) != 8 || inst_get_str_imm9_rn(canary) != 29
+        || inst_get_str_imm9_mode(canary) || inst_get_str_imm9_imm9(canary) != -8
+        || !nm_pair_store_at(src[12], 31, 31, 31, 16) || !nm_pair_store_at(src[13], 31, 31, 31, 32)
+        || !nm_pair_store_at(src[14], 31, 31, 31, 72) || !nm_pair_store_at(src[15], 31, 1, 31, 48)
+        || !nm_store_at(src[16], 3, 2, 31, 64)
+        || !nm_load_unscaled(src[17], 8, 19, inst_get_ldr_imm9_imm9(src[17]), 3)
+        || inst_get_ldr_imm9_imm9(src[17]) <= 0 || inst_get_ldr_imm9_imm9(src[17]) % 8
+        || !nm_move(src[18], 21, 0) || !nm_move(src[19], 22, 3) || !nm_load_at(src[20], 9, 8, 8)
+        || !nm_pair_store_at(src[21], 9, 10, 31, 72) || !nm_load(src[22], 3, 8) || inst_get_ldr_imm_rt(src[22]) != 23)
+      return -EOPNOTSUPP;
+    slot = inst_get_ldr_imm_imm(src[22]);
+    return slot >= sizeof(struct nm_key_type_head) && slot + sizeof(struct nm_key_callbacks) <= NM_KEY_TYPE_PROBE_SIZE
+               ? slot : -EINVAL;
+  }
   bool pac = inst_is_paciasp(src[0]);
   bool sub = inst_is_sub_imm(src[pac ? 1 : 0]);
   if (!sub) {
@@ -2647,12 +2814,37 @@ static int nm_find_key_type_link_legacy(const uint32_t* src, uintptr_t down_writ
   return link;
 }
 
+/* 从src的unregister入口核对link和成对自指针写回，两个地址参数绑定原生调用身份。
+ * 成功返回link位移，失败返回负错误；新增19条四帧入口，旧窗口保持。
+ */
 static int nm_find_key_type_link(const uint32_t* src, uintptr_t down_write, uintptr_t list_valid) {
   if (!src || !down_write)
     return -ENOENT;
   int legacy = nm_find_key_type_link_legacy(src, down_write, list_valid);
   if (legacy >= 0 || legacy == -EINVAL)
     return legacy;
+  if (nm_move(src[4], 19, 0) && nm_page_address(&src[5], 0)) {
+    for (unsigned i = 0; i < 4; i++)
+      if (!nm_rule_entry_save(src[i]))
+        return -EOPNOTSUPP;
+    if (!list_valid || !inst_is_bl(src[7]) || (uintptr_t)&src[7] + inst_get_bl_label(src[7]) != down_write
+        || !inst_is_add_imm(src[8]) || !inst_get_add_imm_sf(src[8]) || inst_get_add_imm_rd(src[8]) != 20
+        || inst_get_add_imm_rn(src[8]) != 19 || inst_get_add_imm_sh(src[8]) || !nm_move(src[9], 0, 20)
+        || !inst_is_bl(src[10]) || (uintptr_t)&src[10] + inst_get_bl_label(src[10]) != list_valid
+        || !inst_is_tbz(src[11]) || inst_get_tbz_rt(src[11]) || inst_get_tbz_bit(src[11])
+        || inst_get_tbz_label(src[11]) != 16 || !inst_is_ldp(src[12]) || bit(src[12], 26)
+        || inst_get_ldp_size(src[12]) != 2 || inst_get_ldp_mode(src[12]) != 2 || inst_get_ldp_rn(src[12]) != 19
+        || inst_get_ldp_rt(src[12]) != 9 || inst_get_ldp_rt2(src[12]) != 8
+        || !nm_store_at(src[13], 3, 8, 9, 8) || !nm_store_at(src[14], 3, 9, 8, 0)
+        || !nm_page_address(&src[15], 0))
+      return -EOPNOTSUPP;
+    int link = inst_get_add_imm_imm(src[8]);
+    if (link < NM_KEY_TYPE_PROBE_SIZE || link % 8 || link > 4096 - sizeof(struct nm_key_type_tail)
+        || inst_get_ldp_imm(src[12]) != link || !nm_store_at(src[17], 3, 20, 19, link)
+        || !nm_store_at(src[18], 3, 20, 19, link + 8))
+      return -EINVAL;
+    return link;
+  }
   // GCC内联list_del_init，不要求并不存在的独立校验器；原type始终保存在x20。
   if (inst_is_adrp(src[3]) && inst_get_adrp_rd(src[3]) == 19 && nm_move(src[4], 20, 0)) {
     for (unsigned int i = 0; i < 3; i++)
@@ -3223,7 +3415,33 @@ static int calculate_function_permission_abi_legacy(void) {
   return 0;
 }
 
-// 区分原生两参入口与NULL mount的三参包装；按实参来源匹配，不按内核版本选ABI。
+/* 核对src/native的分离permission包装入口，分别固定7/4条，止于实际BL。
+ * 两个具名API必须调用同一__inode_permission2；src以NULL mount传inode/mask，
+ * native保留原三参数。成功返回0，未知形态或调用身份冲突返回负错误，无布局写入。
+ */
+static int nm_check_split_permission(const uint32_t* src, const uint32_t* native) {
+  if (!src || !native)
+    return -EOPNOTSUPP;
+  if (!nm_rule_entry_save(src[0]) || !nm_add_at(src[1], 29, 31, 0) || !nm_move32(src[2], 2, 1)
+      || !nm_move(src[3], 1, 0) || !inst_is_tbnz(src[4]) || inst_get_tbnz_rt(src[4]) != 2
+      || inst_get_tbnz_bit(src[4]) != 1 || inst_get_tbnz_label(src[4]) <= 8 || !nm_zero64(src[5], 0)
+      || !inst_is_bl(src[6]) || !nm_rule_entry_save(native[0]) || !nm_add_at(native[1], 29, 31, 0)
+      || !inst_is_tbnz(native[2]) || inst_get_tbnz_rt(native[2]) != 2 || inst_get_tbnz_bit(native[2]) != 1
+      || inst_get_tbnz_label(native[2]) <= 4 || !inst_is_bl(native[3]))
+    return -EOPNOTSUPP;
+  uintptr_t impl = kallsyms_lookup_name_by_suffix("__inode_permission2");
+  if (!impl)
+    return -ENOENT;
+  uintptr_t start = kallsyms_lookup_name("_stext"), end = kallsyms_lookup_name("_etext");
+  if (!nm_code_matches((uintptr_t)&src[6] + inst_get_bl_label(src[6]), impl, start, end)
+      || !nm_code_matches((uintptr_t)&native[3] + inst_get_bl_label(native[3]), impl, start, end))
+    return -EINVAL;
+  return 0;
+}
+
+/* 无参数；从原生入口实参取得permission ABI，成功写布局并返回0。
+ * 分离包装与旧入口各自核对，缺符号/未知形态返回负错误，不按版本选择ABI。
+ */
 static int calculate_function_permission_abi(void) {
   int old = calculate_function_permission_abi_legacy();
   if (!old || old == -EINVAL)
@@ -3232,6 +3450,14 @@ static int calculate_function_permission_abi(void) {
   const uint32_t* native = (const void*)kallsyms_lookup_name_by_suffix("inode_permission2");
   if (!src)
     return -ENOENT;
+  int split = nm_check_split_permission(src, native);
+  if (!split) {
+    struct_offset.permission_abi = 0;
+    nm_log_info("layout: permission ABI=0 (shared split implementation)\n");
+    return 0;
+  }
+  if (split != -EOPNOTSUPP)
+    return split;
   if (!native) {
     unsigned int i = 0;
     while (i < 8 && nm_vfs_frame_save(src[i])) i++;
@@ -3889,6 +4115,47 @@ static int nm_set_operation_extents(int acl, int cache, int canonical) {
   return 0;
 }
 
+/* 匹配无KABI追加槽的完整声明族；acl/cache/canonical来自各自原生锚点。
+ * 同时核对完整file_operations、关键槽位及四参path/两参fill ABI，不能仅用
+ * 三个尾部差值拼接其它契约。类型对齐必须由目标node数组步长再次确认。
+ * 成功写三类完整尺寸并返回0；缺证据/冲突返回负错误，不影响旧选择器。
+ */
+static int nm_set_compact_operation_extents(int acl, int cache, int canonical) {
+  if (struct_offset.file_ops_size != sizeof(struct nm_compact_file_operations) || struct_offset.fop_io_bias != 0
+      || struct_offset.fop_open != offsetof(struct nm_compact_file_operations, open)
+      || struct_offset.fop_release != offsetof(struct nm_compact_file_operations, sync.release)
+      || struct_offset.fop_mmap != offsetof(struct nm_compact_file_operations, control.mmap)
+      || struct_offset.fop_splice_read != offsetof(struct nm_compact_file_operations, splice_read)
+      || struct_offset.fop_iterate != offsetof(struct nm_compact_file_operations, io.iterate)
+      || struct_offset.fop_iterate_shared != offsetof(struct nm_compact_file_operations, io.iterate_shared)
+      || struct_offset.iop_getattr != offsetof(struct nm_inode_android_link_prefix, getattr)
+      || struct_offset.getattr_callback_args != 4 || struct_offset.getattr_function_args != 4
+      || struct_offset.getattr_context_kind != 0 || struct_offset.fillattr_abi != 2 || struct_offset.dir_actor_abi != 0
+      || acl - struct_offset.iop_getattr != offsetof(struct nm_compact_inode_tail, set_acl)
+      || struct_offset.sop_drop_inode != offsetof(struct nm_compact_super_operations, tail.lifecycle.drop_inode)
+      || struct_offset.sop_evict_inode != offsetof(struct nm_compact_super_operations, tail.lifecycle.evict_inode)
+      || cache != offsetof(struct nm_compact_super_operations, tail.reporting.cache.nr_cached_objects)
+      || struct_offset.dop_init != sizeof(struct nm_dentry_control_ops)
+      || struct_offset.dop_release != sizeof(struct nm_dentry_control_ops) + sizeof(void*)
+      || canonical - struct_offset.dop_release != offsetof(struct nm_compact_dentry_tail, canonical_path))
+    return -EOPNOTSUPP;
+  const uint32_t* alignment = (const void*)kallsyms_lookup_name_by_suffix("list_lru_count_node");
+  if (!alignment)
+    return -ENOENT;
+  if (nm_find_operation_alignment(alignment) != 64)
+    return -EOPNOTSUPP;
+  int inode = nm_tail_extent(struct_offset.iop_getattr, sizeof(struct nm_compact_inode_tail), 64);
+  int super = sizeof(struct nm_compact_super_operations);
+  int dentry = nm_tail_extent(struct_offset.dop_release, sizeof(struct nm_compact_dentry_tail), 64);
+  if (inode < 0 || dentry < 0)
+    return -EINVAL;
+  struct_offset.inode_ops_size = inode;
+  struct_offset.super_ops_size = super;
+  struct_offset.dentry_ops_size = dentry;
+  nm_log_info("layout: compact operation contract inode/super/dentry=%d/%d/%d\n", inode, super, dentry);
+  return 0;
+}
+
 // d_real只用于无sdcardfs路径。整套契约与原canonical路径分开，禁止跨声明拼接。
 // 该几何只覆盖已离线核对的声明，不能证明未知厂商没有额外尾部（AUD-001）。
 static int nm_set_operation_extents_real(int acl, int cache, int real) {
@@ -3986,6 +4253,8 @@ static int calculate_function_operation_sizes(void) {
     if (last_canonical < 0)
       return last_canonical;
     rc = nm_set_operation_extents(last_acl, last_cache, last_canonical);
+    if (rc == -EOPNOTSUPP)
+      rc = nm_set_compact_operation_extents(last_acl, last_cache, last_canonical);
     if (rc)
       nm_log_error("layout: operation tail contract rejected: getattr=%d acl=%d drop=%d cache=%d init=%d release=%d canonical=%d\n",
                    struct_offset.iop_getattr, last_acl, struct_offset.sop_drop_inode, last_cache,

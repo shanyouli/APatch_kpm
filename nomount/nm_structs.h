@@ -479,6 +479,93 @@ struct nm_dentry_real_reserved_tail {
   void* canonical_path;
   u64 reserved[4];
 };
+// 无KABI追加槽的完整声明，核对来源为MiCode camellia-r-oss固定提交
+// 4b6c276ac99cad51bf4d0bd6ea12a32847403b42。仅作为匹配的布局契约，不按版本号选择。
+// file要求MMU，super要求QUOTA；完整字段及对齐另由原声明编译与目标锚点交叉核对。
+// xchgadd/owner/MTK_TASK_TURBO且无lockdep的原生rwsem与address_space完整声明。
+// 来源同下方compact操作表；每个by-value成员保留，匹配完整初始化后才使用。
+struct nm_compact_radix_root {
+  u32 gfp_mask;
+  void* rnode;
+};
+struct nm_compact_rwsem {
+  int64_t count;
+  void* wait_next;
+  void* wait_prev;
+  u32 wait_lock;
+  u32 osq;
+  void* owner;
+  void* turbo_owner;
+};
+struct nm_compact_address_space {
+  void* host;
+  struct nm_compact_radix_root page_tree;
+  u32 tree_lock;
+  int i_mmap_writable;
+  void* mmap_root;
+  void* mmap_leftmost;
+  struct nm_compact_rwsem mmap_sem;
+  unsigned long nrpages;
+  unsigned long nrexceptional;
+  unsigned long writeback_index;
+  const void* a_ops;
+  unsigned long flags;
+  u32 private_lock;
+  u32 gfp_mask;
+  void* private_next;
+  void* private_prev;
+  void* private_data;
+  u32 wb_err;
+};
+
+struct nm_compact_file_operations {
+  struct nm_file_iteration_ops io;
+  void* poll;
+  struct nm_file_control_ops control;
+  void* open;
+  void* flush;
+  struct nm_file_sync_ops sync;
+  void* fasync;
+  void* lock;
+  void* sendpage;
+  void* get_unmapped_area;
+  void* check_flags;
+  void* flock;
+  void* splice_write;
+  void* splice_read;
+  void* setlease;
+  void* fallocate;
+  void* show_fdinfo;
+  void* copy_file_range;
+  void* clone_file_range;
+  void* dedupe_file_range;
+};
+struct nm_compact_inode_tail {
+  void* getattr;
+  void* listxattr;
+  void* fiemap;
+  void* update_time;
+  void* atomic_open;
+  void* tmpfile;
+  void* set_acl;
+};
+struct nm_compact_super_operations {
+  void* alloc_inode;
+  void* destroy_inode;
+  void* dirty_inode;
+  void* write_inode;
+  struct nm_super_mount_tail tail;
+};
+struct nm_compact_dentry_tail {
+  struct nm_dentry_release_prune lifecycle;
+  void* iput;
+  void* dname;
+  void* automount;
+  void* manage;
+  void* real;
+  void* canonical_path;
+};
+
 // 两份声明各至少有14个独立指针槽；只在这个已确认的前缀内找canonical回调。
 enum { NM_DENTRY_TAIL_PROBE_SIZE = 14 * sizeof(void*) };
 enum nm_operation_anchor { NM_OPERATION_ANCHOR_NONE, NM_OPERATION_ANCHOR_SDCARDFS, NM_OPERATION_ANCHOR_D_REAL };
