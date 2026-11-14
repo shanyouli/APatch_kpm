@@ -1694,7 +1694,10 @@ static int nm_find_inode_hash(const uint32_t* src) {
   return offset - offsetof(struct nm_hlist_node, pprev);
 }
 
-// 短 simple_getattr 核对回调参数与 generic_fillattr 的两参数调用，止于首个 BL。
+/* 核对simple_getattr的path/dentry、stat参数与两参fill调用，src指向函数体。
+ * fill是具名generic_fillattr函数体；仅归一化代码区内单B，可带BTI C。
+ * 成功返回0，未知实参或跳板返回-EOPNOTSUPP；不调用目标函数或写布局。
+ */
 static int nm_check_simple_getattr(const uint32_t* src, uintptr_t fill, bool path) {
   unsigned int i = 0;
   while (i < 4 && nm_rule_entry_save(src[i])) i++;
@@ -1709,8 +1712,11 @@ static int nm_check_simple_getattr(const uint32_t* src, uintptr_t fill, bool pat
       return -EOPNOTSUPP;
     i += 3;
   }
-  if (!nm_move(src[i], 0, 19) || !inst_is_bl(src[i + 1])
-      || (uintptr_t)&src[i + 1] + inst_get_bl_label(src[i + 1]) != fill)
+  if (!nm_move(src[i], 0, 19) || !inst_is_bl(src[i + 1]))
+    return -EOPNOTSUPP;
+  uintptr_t target = (uintptr_t)&src[i + 1] + inst_get_bl_label(src[i + 1]);
+  if (target != fill
+      && !nm_code_matches(target, fill, kallsyms_lookup_name("_stext"), kallsyms_lookup_name("_etext")))
     return -EOPNOTSUPP;
   return 0;
 }
@@ -1844,11 +1850,61 @@ static int nm_check_inline_simple_getattr(const uint32_t* src, const uint32_t* f
   return 0;
 }
 
-// 两个CFI入口的属性处理分别整体核对；不以“任意未写x0”跳过未知指令。
+/* 核对SUB栈帧的vfs_getattr_nosec入口，src/simple分别为两个具名函数体。
+ * 六个CFI检查指令可与mask设置交错；固定28条止于首个BLR，不追拒绝分支。
+ * fill用于独立核对simple_getattr的两参调用。成功返回getattr槽位，失败返回负值，
+ * 不写布局；可选PAC只增加一条已支持的序言，未知字段/参数形态仍拒绝。
+ */
+static int nm_find_sub_getattr(const uint32_t* src, const uint32_t* simple, uintptr_t fill) {
+  if (inst_is_paciasp(src[0]))
+    src++;
+  if (!inst_is_sub_imm(src[0]) || !inst_get_sub_imm_sf(src[0]) || inst_get_sub_imm_rd(src[0]) != 31
+      || inst_get_sub_imm_rn(src[0]) != 31 || inst_get_sub_imm_imm(src[0]) != 48
+      || !nm_pair_store_at(src[1], 29, 30, 31, 32) || !nm_add_at(src[2], 29, 31, 32)
+      || !nm_load_at(src[3], 8, 0, offsetof(struct nm_path, dentry))
+      || !nm_load_at(src[4], 9, 8, offsetof(struct nm_dentry_head, d_inode)) || !nm_movz_value(src[5], 0, 8, 0x7ff))
+    return -EOPNOTSUPP;
+  for (unsigned i = 6; i <= 13; i++)
+    if (!nm_pair_store_at(src[i], 31, 31, 1, 120 - (i - 6) * 16))
+      return -EOPNOTSUPP;
+  if (!nm_store_at(src[14], 3, 31, 1, 0) || !nm_store_at(src[15], 2, 8, 1, 0)
+      || !nm_load_at(src[16], 8, 9, struct_offset.inode_superblock - 8) || !nm_load(src[17], 3, 8)
+      || inst_get_ldr_imm_rt(src[17]) != 8 || !inst_is_cbz(src[18]) || !inst_get_cbz_sf(src[18])
+      || inst_get_cbz_rt(src[18]) != 8 || inst_get_cbz_label(src[18]) <= 36 || !inst_is_and_imm(src[23])
+      || inst_get_and_imm_sf(src[23]) || inst_get_and_imm_rd(src[23]) != 2 || inst_get_and_imm_rn(src[23]) != 2
+      || inst_get_and_imm_imm(src[23]) != 0xfff || !inst_is_and_imm(src[25]) || inst_get_and_imm_sf(src[25])
+      || inst_get_and_imm_rd(src[25]) != 3 || inst_get_and_imm_rn(src[25]) != 3
+      || inst_get_and_imm_imm(src[25]) != 0x6000 || !inst_is_blr(src[27]) || inst_get_blr_rn(src[27]) != 8)
+    return -EOPNOTSUPP;
+  uint32_t gate[] = {src[19], src[20], src[21], src[22], src[24], src[26]};
+  if (!nm_cfi_gate_stride(gate, 8, 9, 4))
+    return -EOPNOTSUPP;
+  int rc = nm_check_simple_getattr(simple, fill, true);
+  if (rc)
+    return rc;
+  int field = inst_get_ldr_imm_imm(src[17]);
+  return field >= (int)sizeof(struct nm_inode_lookup_ops) && field % 8 == 0 && field <= 0x7fff ? field : -EINVAL;
+}
+
+/* 核对src/simple的属性回调入口与fill原型证据；成功写回槽位及ABI并返回0。
+ * 旧路径先执行且保留有效布局错误；新SUB形态按已确认四参path契约接受，
+ * 其它CFI入口仍整体核对。失败返回负错误，不按内核版本选择布局。
+ */
 static int nm_find_getattr_layout(const uint32_t* src, const uint32_t* simple, uintptr_t fill) {
   int old = nm_find_getattr_layout_previous(src, simple, fill);
   if (!old || old == -EINVAL)
     return old;
+  int sub_field = nm_find_sub_getattr(src, simple, fill);
+  if (sub_field >= 0) {
+    struct_offset.iop_getattr = sub_field;
+    struct_offset.getattr_callback_args = 4;
+    struct_offset.getattr_function_args = 4;
+    struct_offset.getattr_context_kind = 0;
+    struct_offset.fillattr_abi = 2;
+    return 0;
+  }
+  if (sub_field == -EINVAL)
+    return sub_field;
   bool pac = inst_is_paciasp(src[0]);
   int field;
   uint32_t gate[6];
@@ -2739,7 +2795,10 @@ static int nm_check_directory_iteration_legacy(const uint32_t* src, int slot) {
   return 0;
 }
 
-// 只核对读取iterate槽之前的参数保存与f_inode/f_op共同片段；后续执行仍交原生iterate_dir。
+/* 核对src入口的file→inode/f_op及slot指定的iterate槽，止于NULL守卫。
+ * 支持已确认的x23/x24 inode保存和对应共享槽；成功写iterate布局并返回0，
+ * 未覆盖返回负错误，不调用原生iterate_dir，也不取得完整表尺寸。
+ */
 static int nm_check_directory_iteration(const uint32_t* src, int slot) {
   int rc = nm_check_directory_iteration_legacy(src, slot);
   if (!rc || rc == -EINVAL)
@@ -2762,7 +2821,8 @@ static int nm_check_directory_iteration(const uint32_t* src, int slot) {
     uint32_t load = src[pair];
     int callback = inst_get_ldr_imm_rt(src[pair + 3]);
     if (!inst_is_ldp(load) || bit(load, 26) || inst_get_ldp_size(load) != 2 || inst_get_ldp_mode(load) != 2
-        || inst_get_ldp_rt(load) != 23 || inst_get_ldp_rt2(load) != 8 || inst_get_ldp_rn(load) != 0
+        || (inst_get_ldp_rt(load) != 23 && inst_get_ldp_rt(load) != 24) || inst_get_ldp_rt2(load) != 8
+        || inst_get_ldp_rn(load) != 0
         || inst_get_ldp_imm(load) != struct_offset.file_inode_ops || !nm_move(src[pair + 1], 19, 0)
         || !(nm_move(src[pair + 2], 22, 1) || nm_move(src[pair + 2], 21, 1) || nm_move(src[pair + 2], 20, 1))
         || (callback != 9 && callback != 22) || !nm_load_at(src[pair + 3], callback, 8, slot)
@@ -2884,6 +2944,34 @@ static int nm_dentry_prune_slot(int slot) {
   return 0;
 }
 
+/* 核对src的五帧dentry prune入口；dead/start/end绑定原生调用与代码边界。
+ * 固定25条止于prune调用，x19保留dentry、x21保留lockref，LR仅保存在x20。
+ * 成功以共同release/prune片段写槽并返回0，未知形态返回负错误，不执行调用。
+ */
+static int nm_find_saved_dentry_prune(const uint32_t* src, uintptr_t dead, uintptr_t start, uintptr_t end) {
+  for (unsigned i = 0; i < 5; i++)
+    if (!nm_rule_entry_save(src[i]))
+      return -EOPNOTSUPP;
+  if (!nm_load_at(src[5], 8, 0, offsetof(struct nm_dentry_head, d_parent))
+      || !nm_add_at(src[6], 21, 0, struct_offset.dentry_lock) || !nm_move(src[7], 19, 0)
+      || !nm_move(src[8], 20, 30) || !nm_compare(src[9], 8, 0) || !nm_move(src[10], 0, 21)
+      || !inst_is_csel(src[11]) || !inst_get_csel_sf(src[11]) || inst_get_csel_rd(src[11]) != 23
+      || inst_get_csel_rn(src[11]) != 31 || inst_get_csel_rm(src[11]) != 8 || inst_get_csel_cond(src[11])
+      || !inst_is_bl(src[12])
+      || !nm_code_matches((uintptr_t)&src[12] + inst_get_bl_label(src[12]), dead, start, end)
+      || !nm_load(src[13], 2, 19) || inst_get_ldr_imm_rt(src[13]) != 8 || inst_get_ldr_imm_imm(src[13])
+      || !inst_is_tbz(src[14]) || inst_get_tbz_rt(src[14]) != 8
+      || inst_get_tbz_bit(src[14]) != 4 || inst_get_tbz_label(src[14]) <= 40
+      || !nm_load_at(src[15], 8, 19, struct_offset.dentry_ops) || !nm_load(src[16], 3, 8)
+      || inst_get_ldr_imm_rt(src[16]) != 22 || !nm_cfi_gate_stride(&src[17], 22, 8, 8)
+      || !nm_move(src[23], 0, 19) || !inst_is_blr(src[24]) || inst_get_blr_rn(src[24]) != 22)
+    return -EOPNOTSUPP;
+  return nm_dentry_prune_slot(inst_get_ldr_imm_imm(src[16]));
+}
+
+/* 从src取得dentry生命周期槽，dead/start/end用于原生身份与读取边界核对。
+ * 成功写布局并返回0，失败返回负错误；旧入口先执行，新五帧路径最多25条。
+ */
 static int nm_find_dentry_lifecycle(const uint32_t* src, uintptr_t dead, uintptr_t start, uintptr_t end) {
   int old = nm_find_dentry_lifecycle_legacy(src, dead, start, end);
   if (!old || old == -EINVAL)
@@ -2891,6 +2979,9 @@ static int nm_find_dentry_lifecycle(const uint32_t* src, uintptr_t dead, uintptr
   bool pac = inst_is_paciasp(src[0]);
   if (pac)
     src++;
+  int saved = nm_find_saved_dentry_prune(src, dead, start, end);
+  if (!saved || saved == -EINVAL)
+    return saved;
   // GCC把prune块放在前向TBNZ目标处；只读入口13条和目标6条，不扫描中间函数体。
   if (nm_move(src[3], 19, 0)) {
     for (unsigned i = 0; i < 3; i++)
@@ -2970,12 +3061,47 @@ static int nm_find_dentry_lifecycle(const uint32_t* src, uintptr_t dead, uintptr
   return nm_dentry_prune_slot(inst_get_ldr_imm_imm(src[load]));
 }
 
+/* 核对src的五帧empty_dir_readdir入口；固定29条包含六个actor实参与int返回守卫。
+ * 成功返回0，未知字段/CFI/参数形态返回负错误；不调用actor，不修改布局。
+ */
+static int nm_find_five_frame_actor(const uint32_t* src) {
+  if (struct_offset.file_inode_ops < (int)sizeof(struct nm_path))
+    return -EINVAL;
+  int dentry = struct_offset.file_inode_ops - (int)offsetof(struct nm_file_path_inode_ops, f_inode)
+               + (int)offsetof(struct nm_file_path_inode_ops, f_path.dentry);
+  for (unsigned i = 0; i < 5; i++)
+    if (!nm_rule_entry_save(src[i]))
+      return -EOPNOTSUPP;
+  if (!nm_load_at(src[5], 8, 1, offsetof(struct nm_dir_context, pos)) || !nm_move(src[6], 19, 1)
+      || !nm_move(src[7], 20, 0) || !inst_is_subs_imm(src[8]) || !inst_get_subs_imm_sf(src[8])
+      || inst_get_subs_imm_rd(src[8]) != 31 || inst_get_subs_imm_rn(src[8]) != 8
+      || inst_get_subs_imm_imm(src[8]) != 1 || !inst_is_b_cond(src[9]) || inst_get_b_cond_cond(src[9])
+      || inst_get_b_cond_label(src[9]) <= 72 || !inst_is_cbnz(src[10]) || !inst_get_cbnz_sf(src[10])
+      || inst_get_cbnz_rt(src[10]) != 8 || inst_get_cbnz_label(src[10]) <= 68
+      || !nm_load_at(src[11], 21, 19, offsetof(struct nm_dir_context, actor))
+      || !nm_cfi_gate_stride(&src[12], 21, 8, 40) || !nm_zero64(src[18], 3)
+      || !nm_load_at(src[19], 8, 20, dentry) || !inst_is_adrp(src[20]) || inst_get_adrp_rd(src[20]) != 1
+      || !nm_add_at(src[21], 1, 1, inst_get_add_imm_imm(src[21])) || !nm_movz_value(src[22], 0, 2, 1)
+      || !nm_load_at(src[23], 8, 8, offsetof(struct nm_dentry_head, d_inode)) || !nm_movz_value(src[24], 0, 5, 4)
+      || !nm_move(src[25], 0, 19) || !nm_load_at(src[26], 4, 8, struct_offset.inode_number)
+      || !inst_is_blr(src[27]) || inst_get_blr_rn(src[27]) != 21 || !inst_is_cbnz(src[28])
+      || inst_get_cbnz_sf(src[28]) || inst_get_cbnz_rt(src[28]) || inst_get_cbnz_label(src[28]) <= 0)
+    return -EOPNOTSUPP;
+  return 0;
+}
+
+/* 核对src的actor类型、参数和停止语义，成功返回0，未覆盖返回负错误。
+ * 旧入口先执行，PAC只跳过一条序言；新增五帧入口不替代原20/30条判据。
+ */
 static int nm_find_directory_actor(const uint32_t* src) {
   int old = nm_find_directory_actor_legacy(src);
   if (!old || old == -EINVAL)
     return old;
   if (inst_is_paciasp(src[0]))
     src++;
+  int five_frame = nm_find_five_frame_actor(src);
+  if (!five_frame || five_frame == -EINVAL)
+    return five_frame;
   int dentry = struct_offset.file_inode_ops - (int)offsetof(struct nm_file_path_inode_ops, f_inode)
                + (int)offsetof(struct nm_file_path_inode_ops, f_path.dentry);
   bool gcc = nm_move(src[4], 20, 0);
@@ -3221,12 +3347,82 @@ static int nm_find_super_lifecycle_legacy(const uint32_t* src) {
   return 0;
 }
 
-// 新GCC/Clang入口：先证实sb/s_op的保存，再只接受不改写x19/x20的已核对前缀。
-// 最长到PAC目标的第45条；不在整个函数内搜索回调加载。
+/* 核对src所指BL与具名内核函数name的身份；只解析代码区内单B/BTI C跳板。
+ * 成功返回true，缺符号或未知跳板返回false；不执行调用、不改布局。
+ */
+static bool nm_super_named_call(const uint32_t* src, const char* name) {
+  if (!inst_is_bl(src[0]))
+    return false;
+  uintptr_t target = (uintptr_t)src + inst_get_bl_label(src[0]);
+  return nm_code_matches(target, kallsyms_lookup_name_by_suffix(name), kallsyms_lookup_name("_stext"),
+                         kallsyms_lookup_name("_etext"));
+}
+
+/* 核对带workqueue清理的generic_shutdown_super函数体src，固定49条止于put_super调用。
+ * sb保存在x19、s_op保存在x21，逐项确认所有调用身份、守卫和寄存器来源；
+ * 不跳读分支目标，不从其它类型的字段猜s_op。可选PAC只增加一条序言。
+ * 成功写drop/evict槽并返回0，未覆盖/无效槽返回负错误；不取得完整表尺寸。
+ */
+static int nm_find_shutdown_workqueue(const uint32_t* src) {
+  if (inst_is_paciasp(src[0]))
+    src++;
+  for (unsigned i = 0; i < 4; i++)
+    if (!nm_rule_entry_save(src[i]))
+      return -EOPNOTSUPP;
+  if (!nm_load(src[4], 3, 0) || inst_get_ldr_imm_rt(src[4]) != 8 || !nm_move(src[5], 19, 0)
+      || !inst_is_cbz(src[6]) || !inst_get_cbz_sf(src[6]) || inst_get_cbz_rt(src[6]) != 8
+      || inst_get_cbz_label(src[6]) <= 168 || !nm_load_at(src[7], 21, 19, offsetof(struct nm_super_head, s_op))
+      || !nm_add_at(src[8], 0, 19, inst_get_add_imm_imm(src[8])) || inst_get_add_imm_imm(src[8]) <= 0
+      || !nm_super_named_call(&src[9], "down_read_trylock") || !inst_is_cbnz(src[10])
+      || inst_get_cbnz_sf(src[10]) || inst_get_cbnz_rt(src[10]) || inst_get_cbnz_label(src[10]) <= 152
+      || !nm_load_at(src[11], 0, 19, inst_get_ldr_imm_imm(src[4]))
+      || !nm_store_at(src[12], 3, 31, 19, inst_get_ldr_imm_imm(src[4]))
+      || !nm_super_named_call(&src[13], "do_one_tree") || !nm_load(src[14], 3, 19)
+      || inst_get_ldr_imm_rt(src[14]) != 8 || !inst_is_subs_imm(src[15]) || !inst_get_subs_imm_sf(src[15])
+      || inst_get_subs_imm_rd(src[15]) != 31 || inst_get_subs_imm_rn(src[15]) != 8
+      || inst_get_subs_imm_imm(src[15]) != 2 || !inst_is_b_cond(src[16]) || inst_get_b_cond_cond(src[16]) != 2
+      || inst_get_b_cond_label(src[16]) <= 128 || !nm_move(src[17], 0, 19)
+      || !nm_super_named_call(&src[18], "sync_filesystem")
+      || !nm_load_at(src[19], 8, 19, offsetof(struct nm_super_head, s_flags)) || !nm_move(src[20], 0, 19)
+      || !inst_is_and_imm(src[21]) || !inst_get_and_imm_sf(src[21]) || inst_get_and_imm_rd(src[21]) != 8
+      || inst_get_and_imm_rn(src[21]) != 8 || inst_get_and_imm_imm(src[21]) != 0xffffffffbfffffffULL
+      || !nm_store_at(src[22], 3, 8, 19, offsetof(struct nm_super_head, s_flags))
+      || !nm_super_named_call(&src[23], "fsnotify_unmount_inodes") || !inst_is_adrp(src[24])
+      || inst_get_adrp_rd(src[24]) != 8 || !nm_load(src[25], 2, 8) || inst_get_ldr_imm_rt(src[25]) != 8
+      || !inst_is_cbz(src[26]) || inst_get_cbz_sf(src[26]) || inst_get_cbz_rt(src[26]) != 8
+      || inst_get_cbz_label(src[26]) != 28 || !inst_is_adrp(src[27]) || inst_get_adrp_rd(src[27]) != 0
+      || !nm_add_at(src[28], 0, 0, inst_get_add_imm_imm(src[28]))
+      || !nm_super_named_call(&src[29], "_rcu_barrier") || !inst_is_adrp(src[30])
+      || inst_get_adrp_rd(src[30]) != 8 || !nm_load(src[31], 3, 8) || inst_get_ldr_imm_rt(src[31])
+      || !nm_super_named_call(&src[32], "flush_workqueue") || !nm_move(src[33], 0, 19)
+      || !nm_super_named_call(&src[34], "evict_inodes") || !nm_load(src[35], 3, 19)
+      || inst_get_ldr_imm_rt(src[35]) || !inst_is_cbz(src[36]) || !inst_get_cbz_sf(src[36])
+      || inst_get_cbz_rt(src[36]) || inst_get_cbz_label(src[36]) != 12
+      || !nm_super_named_call(&src[37], "destroy_workqueue")
+      || !nm_store_at(src[38], 3, 31, 19, inst_get_ldr_imm_imm(src[35])) || !nm_load(src[39], 3, 21)
+      || inst_get_ldr_imm_rt(src[39]) != 20 || !inst_is_cbz(src[40]) || !inst_get_cbz_sf(src[40])
+      || inst_get_cbz_rt(src[40]) != 20 || inst_get_cbz_label(src[40]) <= 32
+      || !nm_cfi_gate_stride(&src[41], 20, 8, 8) || !nm_move(src[47], 0, 19)
+      || !inst_is_blr(src[48]) || inst_get_blr_rn(src[48]) != 20)
+    return -EOPNOTSUPP;
+  int first = inst_get_ldr_imm_imm(src[39]) - (int)offsetof(struct nm_super_lifecycle_ops, put_super);
+  if (first < 0 || first % 8 || first > 0x7fff - (int)sizeof(struct nm_super_lifecycle_ops))
+    return -EINVAL;
+  struct_offset.sop_drop_inode = first + offsetof(struct nm_super_lifecycle_ops, drop_inode);
+  struct_offset.sop_evict_inode = first + offsetof(struct nm_super_lifecycle_ops, evict_inode);
+  return 0;
+}
+
+/* 从src所指super回调入口取得生命周期槽；成功写布局并返回0，失败返回负错误。
+ * 保留原25/35及GCC/Clang入口；仅已确认的workqueue形态读取49条，不扫整函数。
+ */
 static int nm_find_super_lifecycle(const uint32_t* src) {
   int old = nm_find_super_lifecycle_legacy(src);
   if (!old || old == -EINVAL)
     return old;
+  int workqueue = nm_find_shutdown_workqueue(src);
+  if (!workqueue || workqueue == -EINVAL)
+    return workqueue;
   unsigned int i = 0;
   while (i < 6 && nm_vfs_frame_save(src[i])) i++;
   int root;
@@ -3728,6 +3924,10 @@ static int nm_set_operation_extents_real(int acl, int cache, int real) {
   return 0;
 }
 
+/* 无参数；从具名字段锚点与已核对尾部契约取得操作表完整尺寸。
+ * 成功写回三类尺寸并返回0；任一字段或联合尾部契约未确认时返回负错误，
+ * 日志标记实际失败阶段，不用自建容量掩盖原表复制范围缺失。
+ */
 static int calculate_function_operation_sizes(void) {
   nm_operation_anchor = NM_OPERATION_ANCHOR_NONE;
   const uint32_t* acl = (const void*)kallsyms_lookup_name_by_suffix("set_posix_acl");
@@ -3744,18 +3944,31 @@ static int calculate_function_operation_sizes(void) {
   }
   // 只调用字段探测，不调用要求完整尺寸的公共校验器，避免准备阶段循环依赖。
   int rc = calculate_function_inode_callbacks();
-  if (!rc)
+  if (rc)
+    nm_log_error("layout: operation inode callbacks failed (%d)\n", rc);
+  if (!rc) {
     rc = calculate_function_super_callbacks();
-  if (!rc)
+    if (rc)
+      nm_log_error("layout: operation super callbacks failed (%d)\n", rc);
+  }
+  if (!rc) {
     rc = calculate_function_directory_offsets();
-  if (!rc)
+    if (rc)
+      nm_log_error("layout: operation directory fields failed (%d)\n", rc);
+  }
+  if (!rc) {
     rc = calculate_function_directory_callbacks();
+    if (rc)
+      nm_log_error("layout: operation directory callbacks failed (%d)\n", rc);
+  }
   if (rc)
     return rc;
   int last_acl = nm_find_set_acl_vfs(acl);
   int last_cache = nm_find_super_cache_vfs(count);
-  if (last_acl < 0 || last_cache < 0)
+  if (last_acl < 0 || last_cache < 0) {
+    nm_log_error("layout: operation tail anchors failed: set_acl=%d cache=%d\n", last_acl, last_cache);
     return last_acl < 0 ? last_acl : last_cache;
+  }
   // 新VFS形态还需原生node步长确认64字节类型对齐，不能将128字节目标套入旧尾部。
   // 旧识别器已支持的声明保持原入口契约，不增加新的符号前提。
   if (nm_find_set_acl(acl) < 0 || nm_find_super_cache(count) < 0) {
@@ -3773,6 +3986,10 @@ static int calculate_function_operation_sizes(void) {
     if (last_canonical < 0)
       return last_canonical;
     rc = nm_set_operation_extents(last_acl, last_cache, last_canonical);
+    if (rc)
+      nm_log_error("layout: operation tail contract rejected: getattr=%d acl=%d drop=%d cache=%d init=%d release=%d canonical=%d\n",
+                   struct_offset.iop_getattr, last_acl, struct_offset.sop_drop_inode, last_cache,
+                   struct_offset.dop_init, struct_offset.dop_release, last_canonical);
   } else {
     nm_operation_anchor = NM_OPERATION_ANCHOR_D_REAL;
     nm_log_info("layout: operation anchor=d_set_d_op\n");
