@@ -543,3 +543,9 @@ README 仅写普通用户的文件选择、界面操作和可见状态；加载�
 - `nm_check_rule_sub_frame`核对vfs_open前19条：SUB先分配64字节栈帧、明确保存FP/LR和callee-saved，再跟踪path→dentry、独立file/cred参数、两个跳过复制区的守卫、16字节path复制和dentry→inode读取。只匹配已观察的入口，不沿分支跳读，不扩大旧18条形态的接受范围；复制位置仍由已确认file_inode_ops与共同path片段取得。
 - 新增公共入口`tools/test_rule_prefix_entry.py`，复用生产函数提取器：真实7/19/6条窗口、逐条NOP、参数/位宽/分支/写回破坏、可替换file片段位置、旧四帧形态，以及含/不含PAC的保护页。旧测试与Oracle均不改，宿主ASan/UBSan及ARM64语法核验通过。
 - 同一目标与9401e21基线对照，规则准备从EOPNOTSUPP变为0，hash参数数为3；基础字段准备继续为0。但文件字段及后续必要阶段仍未全部通过，不作为完整可加载候选，也不据此要求用户再上机试错。KPM构建仍交CI，本轮只做离线核验。
+
+## 2026-11-15 MIUI 原生 vmalloc 分类入口
+
+- 03:51日志确认三表尺寸修复已生效（inode/super/dentry为192/232/128），首个阻塞转为`nm_prepare_native`的vmalloc分类。目标没有独立`is_vmalloc_addr`；其`kvfree`没有SCS序言，16条完整函数包含两个独立恢复FP/LR并RET的出口，不匹配原14条SCS合流出口。
+- `nm_find_vmalloc_range`保留原14条契约，并增加16条形态；两组完整64位范围常量、无符号比较、分支目标和具名vfree/kfree调用全部核对后才写输出。不按版本硬填范围，RCU释放仍使用vfree_atomic/kfree，不改变原生生命周期策略。
+- 公共入口`tools/test_vmalloc_entry.py`覆盖真实16条、旧14条、常量变化、位宽/来源/分支/调用身份反例、失败输出保持及保护页；既有Oracle不改。指定Image的原生绑定与布局12阶段已宿主回放为0，不等于实际分配、注册、CFI或真机加载通过。记录见`Developer/reports/responses/2026-11-15-nomount-vmalloc-entry-repair.md`。

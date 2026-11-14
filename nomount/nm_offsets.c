@@ -4651,17 +4651,21 @@ static int nm_prepare_backing_directory_abi(void) {
   return 0;
 }
 
-// kvfree首14条中的内联is_vmalloc_addr；只接受保留x0并分派到原生vfree/kfree的形态。
-// 两种偏移模式共用；地址范围来自运行内核，不进入静态结构体偏移表。
+/* 从src的kvfree入口核对内联地址范围及vfree/kfree分派，两地址参数绑定原生函数。
+ * 旧SCS入口限14条；无SCS双返回入口限16条，并核对两条路径的帧恢复和RET。
+ * 成功写range[2]并返回0，未知形态或身份/范围冲突返回负错误且不写range。
+ * 两种偏移模式共用，不执行目标函数，不按内核版本设置范围。
+ */
 static int nm_find_vmalloc_range(const uint32_t* src, uintptr_t vfree, uintptr_t kfree, uintptr_t range[2]) {
   if (!src || !vfree || !kfree)
     return -ENOENT;
-  // SCS保存LR，建立栈帧；三条均保持入口地址x0。
-  if (src[0] != 0xf800865eU || src[1] != 0xa9bf7bfdU || src[2] != 0x910003fdU)
+  bool framed = src[0] == 0xa9bf7bfdU && src[1] == 0x910003fdU;
+  // SCS保存LR，建立栈帧；两种入口均保持地址参数x0。
+  if (!framed && (src[0] != 0xf800865eU || src[1] != 0xa9bf7bfdU || src[2] != 0x910003fdU))
     return -EOPNOTSUPP;
   uintptr_t bounds[2];
   for (unsigned int i = 0; i < 2; i++) {
-    unsigned int at = i ? 7 : 3;
+    unsigned int at = (i ? 7 : 3) - (framed ? 1 : 0);
     uint32_t first = src[at], patch = src[at + 1], compare = src[at + 2], branch = src[at + 3];
     uint64_t value;
     if (inst_is_orr_imm(first) && inst_get_orr_imm_sf(first) && inst_get_orr_imm_rn(first) == 31
@@ -4686,10 +4690,15 @@ static int nm_find_vmalloc_range(const uint32_t* src, uintptr_t vfree, uintptr_t
     unsigned int shift = 16 * inst_get_movk_imm_hw(patch);
     bounds[i] = (value & ~(0xffffULL << shift)) | ((uint64_t)inst_get_movk_imm_imm16(patch) << shift);
   }
-  if (!inst_is_bl(src[11]) || (uintptr_t)&src[11] + inst_get_bl_label(src[11]) != vfree || !inst_is_b(src[12])
-      || inst_get_b_label(src[12]) != 8 || !inst_is_bl(src[13])
-      || (uintptr_t)&src[13] + inst_get_bl_label(src[13]) != kfree || bounds[0] > bounds[1]
+  unsigned int vm_call = framed ? 10 : 11;
+  if (!inst_is_bl(src[vm_call]) || (uintptr_t)&src[vm_call] + inst_get_bl_label(src[vm_call]) != vfree
+      || !inst_is_bl(src[13]) || (uintptr_t)&src[13] + inst_get_bl_label(src[13]) != kfree || bounds[0] > bounds[1]
       || (bounds[0] >> 48) != 0xffff || (bounds[1] >> 48) != 0xffff)
+    return -EOPNOTSUPP;
+  if (framed) {
+    if (src[11] != 0xa8c17bfdU || src[12] != 0xd65f03c0U || src[14] != 0xa8c17bfdU || src[15] != 0xd65f03c0U)
+      return -EOPNOTSUPP;
+  } else if (!inst_is_b(src[12]) || inst_get_b_label(src[12]) != 8)
     return -EOPNOTSUPP;
   range[0] = bounds[0];
   range[1] = bounds[1];
