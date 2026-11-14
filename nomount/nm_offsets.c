@@ -653,6 +653,33 @@ static bool nm_rule_entry_save(uint32_t inst) {
              && inst_get_str_imm9_mode(inst) == 1 && inst_get_str_imm9_imm9(inst) == 8);
 }
 
+// 核对先SUB分配栈帧的vfs_open前19条；vfs来自具名核心函数入口。
+// 返回0或-EOPNOTSUPP；只验证参数链和跳过复制区的守卫，不沿分支读取。
+static int nm_check_rule_sub_frame(const uint32_t* vfs) {
+  if (!inst_is_sub_imm(vfs[0]) || !inst_get_sub_imm_sf(vfs[0]) || inst_get_sub_imm_rn(vfs[0]) != 31
+      || inst_get_sub_imm_rd(vfs[0]) != 31 || inst_get_sub_imm_imm(vfs[0]) != 64
+      || !nm_pair_store_at(vfs[1], 29, 30, 31, 16) || !nm_store_at(vfs[2], 3, 21, 31, 32)
+      || !nm_pair_store_at(vfs[3], 20, 19, 31, 48) || !nm_add_at(vfs[4], 29, 31, 16)
+      || !nm_move(vfs[5], 21, 0) || !nm_load_at(vfs[6], 0, 0, offsetof(struct nm_path, dentry))
+      || !nm_move(vfs[7], 19, 2) || !nm_move(vfs[8], 20, 1) || !nm_load(vfs[9], 0, 0)
+      || inst_get_ldr_imm_rt(vfs[9]) != 8 || inst_get_ldr_imm_imm(vfs[9]) != 3)
+    return -EOPNOTSUPP;
+  if (!inst_is_tbnz(vfs[10]) || inst_get_tbnz_rt(vfs[10]) != 8 || inst_get_tbnz_bit(vfs[10]) != 2
+      || inst_get_tbnz_label(vfs[10]) != 60 || !inst_is_adds_imm(vfs[11]) || !inst_get_adds_imm_sf(vfs[11])
+      || inst_get_adds_imm_rd(vfs[11]) != 31 || inst_get_adds_imm_rn(vfs[11]) != 0
+      || inst_get_adds_imm_imm(vfs[11]) != 4095 || !inst_is_b_cond(vfs[12])
+      || inst_get_b_cond_cond(vfs[12]) != 2 || inst_get_b_cond_label(vfs[12]) != 32 || !inst_is_ldp(vfs[13])
+      || bit(vfs[13], 26) || inst_get_ldp_size(vfs[13]) != 2 || inst_get_ldp_mode(vfs[13]) != 2
+      || inst_get_ldp_rn(vfs[13]) != 21 || inst_get_ldp_rt(vfs[13]) != 9 || inst_get_ldp_rt2(vfs[13]) != 8
+      || inst_get_ldp_imm(vfs[13]) || !nm_zero64(vfs[14], 2) || !nm_move(vfs[15], 3, 19)
+      || !nm_pair_store_at(vfs[16], 9, 8, 20, struct_offset.file_inode_ops - sizeof(struct nm_path))
+      || !nm_load_at(vfs[17], 1, 0, offsetof(struct nm_dentry_head, d_inode)) || !nm_move(vfs[18], 0, 20))
+    return -EOPNOTSUPP;
+  return 0;
+}
+
+// 核对open中的mount与vfs中的path/file/inode链；返回0或不支持错误。
+// 旧入口范围保持；新增五条帧保存形态的open/vfs分别需前7/19条。
 static int nm_check_rule_prefixes(const uint32_t* open, const uint32_t* vfs) {
   if (inst_is_paciasp(open[0]))
     open++;
@@ -668,8 +695,16 @@ static int nm_check_rule_prefixes(const uint32_t* open, const uint32_t* vfs) {
     if (!nm_rule_entry_save(open[i]))
       break;
   }
+  // 目标dentry_open多保存一组寄存器，首次mount检查位于索引5。
+  if (!mount && nm_rule_entry_save(open[0]) && nm_rule_entry_save(open[1]) && nm_rule_entry_save(open[2])
+      && nm_rule_entry_save(open[3]) && nm_rule_entry_save(open[4])
+      && nm_load_at(open[5], 8, 0, offsetof(struct nm_path, mnt)) && inst_is_cbz(open[6])
+      && inst_get_cbz_sf(open[6]) && inst_get_cbz_rt(open[6]) == 8 && inst_get_cbz_label(open[6]) == 76)
+    mount = true;
   if (!mount)
     return -EOPNOTSUPP;
+  if (!nm_check_rule_sub_frame(vfs))
+    return 0;
   for (unsigned int i = 0; i < 10; i++) {
     if (i + 4 < 10 && inst_is_mov_reg(vfs[i]) && inst_get_mov_reg_sf(vfs[i]) && inst_get_mov_reg_rd(vfs[i]) == 20
         && !inst_get_mov_reg_rm(vfs[i]) && inst_is_mov_reg(vfs[i + 1]) && inst_get_mov_reg_sf(vfs[i + 1])

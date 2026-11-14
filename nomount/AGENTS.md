@@ -535,3 +535,11 @@ README 仅写普通用户的文件选择、界面操作和可见状态；加载�
 - 指定目标的生产代码回放中，基础 `calculate_offsets` 从失败变为0并得到 d_op=96；规则、文件、完整操作表、inode、目录、permission和控制阶段仍未完整通过。新增入口不是完整设备适配，禁止仅凭它的宿主通过就让用户再次加载。
 - FolkPatch界面的 `-1` 暂未取得对应加载器日志。原始产物、运行端导出解析、init失败和管理器错误仍需分流定位；不得把 `-1` 直接等同于偏移错误或缺后缀导出。构建交CI；以上是提交前的阶段核验，不声明CI或真机通过。
 - 后续用户提供16:42导出报告：该次dmesg已确认NoMount进入init，d_op识别-2导致初始化-22；因此该次不是ELF导入解析失败。新增9条入口识别正针对这个已确认差异，后续布局仍未完整通过。证据追加在 `Developer/reports/issues/2026-11-14-nomount-folkpatch-load-draft.md`，旧报告和原始日志不改写。
+
+## 2026-11-14 MIUI 规则入口核验（适配未完成）
+
+- 用户19:03报告确认上一阶段d_op=96，新失败为`rule prefixes failed (-95)`。该目标`full_name_hash`已匹配原有三参识别，不改hash算法或原型判据；缺口在dentry_open/vfs_open的帧保存和path复制入口。
+- 新增dentry_open前7条形态：五条参数无损的帧保存，随后从x0读取path.mnt并检查NULL。旧五条读取窗口和原检查保持；新分支只在这套具体序言匹配时读取索引5/6。
+- `nm_check_rule_sub_frame`核对vfs_open前19条：SUB先分配64字节栈帧、明确保存FP/LR和callee-saved，再跟踪path→dentry、独立file/cred参数、两个跳过复制区的守卫、16字节path复制和dentry→inode读取。只匹配已观察的入口，不沿分支跳读，不扩大旧18条形态的接受范围；复制位置仍由已确认file_inode_ops与共同path片段取得。
+- 新增公共入口`tools/test_rule_prefix_entry.py`，复用生产函数提取器：真实7/19/6条窗口、逐条NOP、参数/位宽/分支/写回破坏、可替换file片段位置、旧四帧形态，以及含/不含PAC的保护页。旧测试与Oracle均不改，宿主ASan/UBSan及ARM64语法核验通过。
+- 同一目标与9401e21基线对照，规则准备从EOPNOTSUPP变为0，hash参数数为3；基础字段准备继续为0。但文件字段及后续必要阶段仍未全部通过，不作为完整可加载候选，也不据此要求用户再上机试错。KPM构建仍交CI，本轮只做离线核验。
