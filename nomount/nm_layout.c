@@ -2,7 +2,7 @@
 #include <kallsyms.h>
 #include <ksyms.h>
 #include <ktypes.h>
-#include <linux/stddef.h>
+#include <stddef.h>
 
 #include "../kpm_utils.h"
 #include "nm_log.h"
