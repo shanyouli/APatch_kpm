@@ -950,6 +950,41 @@ static int nm_find_private_fields(const uint32_t* src, struct struct_offset* nex
   return -ENOENT;
 }
 
+/* 核对 file_ns_capable 的保存寄存器入口，src 为已确认函数体。
+ * 仅在六条栈帧指令匹配后读取固定22条前缀；不追跳转目标或进入LSM回调。
+ * x0→x21必须保持到凭据读取，分支只接受已核对的capability/链表守卫。
+ * 返回目标LDR的位移；未覆盖返回-ENOENT，位移无效返回-EINVAL，无布局写入。
+ */
+static int nm_find_saved_file_cred(const uint32_t* src) {
+  if (!inst_is_sub_imm(src[0]) || !inst_get_sub_imm_sf(src[0]) || inst_get_sub_imm_rn(src[0]) != 31
+      || inst_get_sub_imm_rd(src[0]) != 31 || inst_get_sub_imm_imm(src[0]) != 80
+      || !nm_pair_store_at(src[1], 29, 30, 31, 16) || !nm_pair_store_at(src[2], 24, 23, 31, 32)
+      || !nm_pair_store_at(src[3], 22, 21, 31, 48) || !nm_pair_store_at(src[4], 20, 19, 31, 64)
+      || !nm_add_at(src[5], 29, 31, 16))
+    return -ENOENT;
+  if (!nm_move32(src[6], 19, 2) || !nm_move(src[7], 20, 1) || !inst_is_subs_imm(src[8])
+      || inst_get_subs_imm_sf(src[8]) || inst_get_subs_imm_rd(src[8]) != 31
+      || inst_get_subs_imm_rn(src[8]) != 2 || inst_get_subs_imm_imm(src[8]) != 38 || !nm_move(src[9], 21, 0)
+      || !inst_is_b_cond(src[10]) || inst_get_b_cond_cond(src[10]) != 3 || inst_get_b_cond_label(src[10]) != 16
+      || !inst_is_adrp(src[11]) || inst_get_adrp_rd(src[11]) != 8 || !nm_load(src[12], 0, 8)
+      || inst_get_ldr_imm_rt(src[12]) != 9 || !inst_is_cbz(src[13]) || inst_get_cbz_sf(src[13])
+      || inst_get_cbz_rt(src[13]) != 9 || inst_get_cbz_label(src[13]) <= 32 || !inst_is_subs_imm(src[14])
+      || inst_get_subs_imm_sf(src[14]) || inst_get_subs_imm_rd(src[14]) != 31
+      || inst_get_subs_imm_rn(src[14]) != 19 || inst_get_subs_imm_imm(src[14]) != 37 || !inst_is_b_cond(src[15])
+      || inst_get_b_cond_cond(src[15]) != 8 || inst_get_b_cond_label(src[15]) <= 24
+      || !inst_is_adrp(src[16]) || inst_get_adrp_rd(src[16]) != 22
+      || !nm_add_at(src[17], 22, 22, inst_get_add_imm_imm(src[17])) || !nm_load_at(src[18], 23, 22, 0)
+      || !nm_compare(src[19], 23, 22) || !inst_is_b_cond(src[20]) || inst_get_b_cond_cond(src[20]) != 0
+      || inst_get_b_cond_label(src[20]) <= 4 || !nm_load(src[21], 3, 21) || inst_get_ldr_imm_rt(src[21]) != 21)
+    return -ENOENT;
+  int offset = inst_get_ldr_imm_imm(src[21]);
+  return offset <= 0x7fff && offset % sizeof(void*) == 0 ? offset : -EINVAL;
+}
+
+/* 从src所指file_ns_capable函数体取得f_cred位移，不修改布局。
+ * 保留直接x0、GCC告警分支及BTI入口；PAC只跳过已支持的一条序言。
+ * 旧短形态先返回，未匹配才尝试严格22条保存寄存器形态；失败保留负错误。
+ */
 static int nm_find_file_cred(const uint32_t* src) {
   // BTI入口：cap检查及全局审计开关分支之前，x0始终为原始file。
   if (inst_is_bti_c(src[0])) {
@@ -987,7 +1022,7 @@ static int nm_find_file_cred(const uint32_t* src) {
     if (delta > 0 && delta < 9 && nm_load(src[3 + delta], 3, 0) && !inst_get_ldr_imm_rt(src[3 + delta]))
       return inst_get_ldr_imm_imm(src[3 + delta]);
   }
-  return -ENOENT;
+  return nm_find_saved_file_cred(src);
 }
 
 static int nm_find_file_flags(const uint32_t* src) {
@@ -1018,6 +1053,10 @@ static int nm_find_file_flags(const uint32_t* src) {
   return -ENOENT;
 }
 
+/* 从具名短入口取得文件存储字段和完整file_operations复制长度。
+ * 无参数；成功写回struct_offset并返回0，缺锚点/无效布局返回负错误。
+ * 凭据等必要字段未确认时不写回；回调槽由后续独立准备取得。
+ */
 static int calculate_file_entry_offsets(void) {
   const uint32_t* open = (const void*)kallsyms_lookup_name("simple_open");
   const uint32_t* seek = (const void*)kallsyms_lookup_name("noop_llseek");
@@ -1036,8 +1075,10 @@ static int calculate_file_entry_offsets(void) {
                      ? inst_get_ldr_imm_imm(seek[0])
                      : -ENOENT;
   int mode = nm_find_file_flags(flags), credentials = nm_find_file_cred(cred);
-  if (position < 0 || mode < 0 || credentials < 0 || position > 0x7fff || mode > 0x7fff || credentials > 0x7fff)
+  if (position < 0 || mode < 0 || credentials < 0 || position > 0x7fff || mode > 0x7fff || credentials > 0x7fff) {
+    nm_log_error("layout: file entry fields rejected: position=%d flags=%d cred=%d\n", position, mode, credentials);
     return -EINVAL;
+  }
   next.file_position = position;
   next.file_flags = mode;
   next.file_cred = credentials;
@@ -1050,6 +1091,8 @@ static int calculate_file_entry_offsets(void) {
     return size;
   next.file_ops_size = size;
   nm_log_info("layout: file_operations size=%d (tty_default_fops)\n", size);
+  nm_log_info("layout: file fields private=%d/%d position=%d flags=%d cred=%d\n", next.inode_private,
+              next.file_private, position, mode, credentials);
   // 对象字段与完整表尺寸已有入口证据；其余回调位置另行取得。
   struct_offset = next;
   return 0;
