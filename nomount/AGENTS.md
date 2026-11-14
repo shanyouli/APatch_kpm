@@ -526,3 +526,12 @@ README 仅写普通用户的文件选择、界面操作和可见状态；加载�
 - `tools/migrate_layout.py` 显式迁移完整旧46项配置，新字段设为旧共同契约的0，原值与输入文件不改。新51项基线必须配新配置；旧基线继续使用其原配套布局和配置，不互换。
 - 静态版仍不推导偏移；新idmap规则入口额外使用目标BTF验证get/list/set/remove/ACL原生ABI。BTF不可用或冲突则ADD失败，规则不发布。静态set/remove写入保持EOPNOTSUPP；读取与syscall list按源path转发。既有plain/userns静态能力保持。
 - `tools/test_612_btf.py` 对选定镜像执行当前生产BTF查询及真实记录变异；`test_612_callbacks.py` 保留int/bool各1907处业务Oracle并追加独立file字段、偏移回调、分列时间和静态idmap入口检查。`test_btf_current.py` 保留8份既有BTF的126处Oracle，以bias=0保留原固定前部测试语义；偏移前部的正例另由真实目标查询覆盖。原测试文件与断言不变。
+
+## 2026-11-14 MIUI dentry 入口核验（适配未完成）
+
+- 本轮目标仅为用户的 `miuiportspatched.img`，内核 `4.14.186-perf-ga368196f0bd0`。设备管理器是 FolkPatch（包名 `me.yuki.folk`）；不能沿用官方 APatch 包名作为是否安装 KP 的判据。免密只读通道核对的运行端 KP 为 `0.13.9`，这不证明与本仓库 SDK 的全部导出相同。
+- `nm_find_dentry_ops` 新增已观察的 Clang 前9条形态：四条参数无损的帧保存，`LDR x8,[x0,#d_op]`，依次保存 LR/dentry/new_ops 到 x21/x19/x20，再以 CBZ x8 前跳16字节。只读取首次 WARN_ON_ONCE 检查，不穿越告警块，不延长原16条失败窗口，也不依赖较远的 STR。偏移取自 LDR 立即数，生产代码不固定96或按版本选择。
+- `tools/test_dentry_entry.py` 是新增的公共宿主核验入口：执行当前生产函数，覆盖真实入口、9条逐指令NOP、16个来源/宽度/分支反例、可替换偏移、PAC前缀、既有GCC/CBNZ形态和保护页。使用已安装宿主Clang，不下载工具链，不构建或加载KPM；原Oracle和既有断言不改。
+- 指定目标的生产代码回放中，基础 `calculate_offsets` 从失败变为0并得到 d_op=96；规则、文件、完整操作表、inode、目录、permission和控制阶段仍未完整通过。新增入口不是完整设备适配，禁止仅凭它的宿主通过就让用户再次加载。
+- FolkPatch界面的 `-1` 暂未取得对应加载器日志。原始产物、运行端导出解析、init失败和管理器错误仍需分流定位；不得把 `-1` 直接等同于偏移错误或缺后缀导出。构建交CI；以上是提交前的阶段核验，不声明CI或真机通过。
+- 后续用户提供16:42导出报告：该次dmesg已确认NoMount进入init，d_op识别-2导致初始化-22；因此该次不是ELF导入解析失败。新增9条入口识别正针对这个已确认差异，后续布局仍未完整通过。证据追加在 `Developer/reports/issues/2026-11-14-nomount-folkpatch-load-draft.md`，旧报告和原始日志不改写。

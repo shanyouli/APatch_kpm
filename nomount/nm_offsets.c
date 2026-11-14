@@ -1190,9 +1190,19 @@ static int nm_find_nlink(const uint32_t* src, unsigned int count) {
   return -ENOENT;
 }
 
+// 从已确认的 d_set_d_op 入口读取 d_op；src 至少覆盖原有16条窗口。
+// 返回目标字节偏移或负错误；不执行告警分支，也不按内核版本选值。
 static int nm_find_dentry_ops(const uint32_t* src) {
   if (inst_is_paciasp(src[0]))
     src++;
+  // Clang保留x19/x20参数和x21返回地址：首个d_op检查在前9条内。
+  // 只识别到WARN_ON_ONCE的CBZ，不穿过后面的告警块或依赖较远的STR。
+  if (nm_rule_entry_save(src[0]) && nm_rule_entry_save(src[1]) && nm_rule_entry_save(src[2])
+      && nm_rule_entry_save(src[3]) && nm_load(src[4], 3, 0) && inst_get_ldr_imm_rt(src[4]) == 8
+      && nm_move(src[5], 21, 30) && nm_move(src[6], 19, 0) && nm_move(src[7], 20, 1)
+      && inst_is_cbz(src[8]) && inst_get_cbz_sf(src[8]) && inst_get_cbz_rt(src[8]) == 8
+      && inst_get_cbz_label(src[8]) == 16)
+    return inst_get_ldr_imm_imm(src[4]);
   // WARN_ON_ONCE(dentry->d_op) 的 GCC 入口；不穿越其告警分支。
   if (nm_load(src[0], 3, 0) && inst_get_ldr_imm_rt(src[0]) != 0 && inst_get_ldr_imm_rt(src[0]) != 1
       && inst_is_cbz(src[1]) && inst_get_cbz_sf(src[1]) && inst_get_cbz_rt(src[1]) == inst_get_ldr_imm_rt(src[0])
