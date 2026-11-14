@@ -19,7 +19,9 @@ static int nm_common_owned_permission(int* slot, int* second) {
   return 0;
 }
 
-// 两个真实Android入口的FASTPERM直达路径；只核对通往generic的参数来源。
+// 两个真实Android入口的FASTPERM直达路径；src/count为固定窗口，generic为具名目标。
+// 核对inode/mask与低位FASTPERM守卫，成功0/未知形态负错误，不执行权限调用。
+// FASTPERM在i_opflags低字节，允许实际LDRB或原LDRH，不把它推广到高位字段。
 static int nm_find_generic_dac_call(const uint32_t* src, unsigned int count, bool split, uintptr_t generic,
                                     uintptr_t start, uintptr_t end) {
   if (!src || count < (split ? 39U : 13U))
@@ -31,7 +33,7 @@ static int nm_find_generic_dac_call(const uint32_t* src, unsigned int count, boo
         return -EOPNOTSUPP;
     if (!nm_move32(src[5], 19, 2) || !nm_move(src[6], 20, 1) || !inst_is_tbnz(src[7]) || inst_get_tbnz_rt(src[7]) != 2
         || inst_get_tbnz_bit(src[7]) != 1 || inst_get_tbnz_label(src[7]) <= 20
-        || (!nm_load(src[8], 1, 20) || inst_get_ldr_imm_rt(src[8]) != 8
+        || ((!nm_load(src[8], 1, 20) && !nm_load(src[8], 0, 20)) || inst_get_ldr_imm_rt(src[8]) != 8
             || inst_get_ldr_imm_imm(src[8]) != offsetof(struct nm_inode_owner_prefix, i_opflags))
         || !inst_is_tbz(src[9]) || inst_get_tbz_rt(src[9]) != 8 || inst_get_tbz_bit(src[9]) != 0
         || inst_get_tbz_label(src[9]) <= 12 || !nm_move(src[10], 0, 20) || !nm_move32(src[11], 1, 19))
@@ -55,6 +57,9 @@ static int nm_find_generic_dac_call(const uint32_t* src, unsigned int count, boo
              : -EOPNOTSUPP;
 }
 
+/* 从具名原生入口确认generic DAC的inode/mask实参，返回0或负错误，不执行目标。
+ * 私有helper存在不等于长形态：优先核对13条直达路径，必要时再核对旧39条路径。
+ */
 static int nm_confirm_generic_dac_abi(void) {
   // 非Android二参推导已核对入口inode/mask到具名generic的直接调用链。
   if (struct_offset.permission_abi == 1) {
@@ -70,8 +75,12 @@ static int nm_confirm_generic_dac_abi(void) {
   if (!entry)
     entry = kallsyms_lookup_name_by_suffix("inode_permission2");
   entry = nm_inode_lock_body(entry, start, end);
-  unsigned int count = split ? 39 : 13;
-  if (!generic || !entry || entry > end || end - entry < count * sizeof(uint32_t))
+  if (!generic || !entry || entry > end || end - entry < 13 * sizeof(uint32_t))
     return -ENODATA;
-  return nm_find_generic_dac_call((const void*)entry, count, split, generic, start, end);
+  int rc = nm_find_generic_dac_call((const void*)entry, 13, false, generic, start, end);
+  if (!rc || !split)
+    return rc;
+  if (end - entry < 39 * sizeof(uint32_t))
+    return -ENODATA;
+  return nm_find_generic_dac_call((const void*)entry, 39, true, generic, start, end);
 }

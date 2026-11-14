@@ -4276,20 +4276,26 @@ static int calculate_function_operation_sizes(void) {
 // 源锁锚点：固定前缀内证明 entry dentry→inode→ADD→成对helper。
 // 只处理前向分支；合流取来源交集，未知写寄存器指令和回边均拒绝。
 struct nm_inode_lock_flow {
-  uint32_t dentry, inode;
-  int phase;
+  uint32_t dentry, inode, lock;
+  int phase, lock_offset;
   bool reached, branch;
 };
 
+/* 合并前向控制流的对象/锁来源；to为汇入状态，from为前驱，branch标记直接跳入。
+ * 同寄存器的锁偏移冲突或锁阶段冲突返回-EINVAL，否则交集写回并返回0。
+ */
 static int nm_inode_lock_merge(struct nm_inode_lock_flow* to, struct nm_inode_lock_flow from, bool branch) {
   if (to->reached) {
-    if (to->phase != from.phase)
+    if (to->phase != from.phase || ((to->lock & from.lock) && to->lock_offset != from.lock_offset))
       return -EINVAL;
     to->dentry &= from.dentry;
     to->inode &= from.inode;
+    to->lock &= from.lock;
   } else {
     to->dentry = from.dentry;
     to->inode = from.inode;
+    to->lock = from.lock;
+    to->lock_offset = from.lock_offset;
     to->phase = from.phase;
     to->reached = true;
   }
@@ -4314,11 +4320,19 @@ static uintptr_t nm_inode_lock_body(uintptr_t at, uintptr_t start, uintptr_t end
   return at;
 }
 
+/* 从src固定前缀证明dentry_arg→inode→锁地址；helpers按读写sem/mutex成对，start/end约束代码。
+ * 成功返回偏移并写kind；未知指令/来源/阶段失败返回负状态，不执行helper。
+ * 普通窗口仍限43；仅已观察的inline removexattr入口允许50条，止于对应解锁BL。
+ */
 static int nm_find_inode_lock(const uint32_t* src, unsigned int count, int dentry_arg, const uintptr_t helpers[4],
                               uintptr_t start, uintptr_t end, int* kind) {
-  if (!src || !count || count > 43 || dentry_arg < 0 || dentry_arg > 1)
+  if (!src || !count || (count > 43 && count != 50) || dentry_arg < 0 || dentry_arg > 1)
     return -EINVAL;
-  struct nm_inode_lock_flow flow[44];
+  if (count == 50 && (dentry_arg != 0 || !nm_add_at(src[3], 29, 31, 0)
+                      || !nm_load_at(src[4], 19, 0, offsetof(struct nm_dentry_head, d_inode))
+                      || !nm_move(src[5], 20, 0) || !nm_move(src[7], 21, 1)))
+    return -EINVAL;
+  struct nm_inode_lock_flow flow[51];
   memset(flow, 0, sizeof(flow));
   flow[0] = (struct nm_inode_lock_flow){.dentry = 1U << dentry_arg, .reached = true};
   int offset = -1, selected = -1, calls = 0;
@@ -4326,7 +4340,7 @@ static int nm_find_inode_lock(const uint32_t* src, unsigned int count, int dentr
     if (!flow[i].reached)
       continue;
     struct nm_inode_lock_flow next = flow[i];
-    uint32_t inst = src[i], written = 0, dent = 0, inode = 0;
+    uint32_t inst = src[i], written = 0, dent = 0, inode = 0, lock = 0;
     int rd = -1, delta = 0;
     bool branch = true, conditional = true;
     if (inst_is_b(inst)) {
@@ -4359,12 +4373,22 @@ static int nm_find_inode_lock(const uint32_t* src, unsigned int count, int dentr
       for (int h = 0; h < 4; h++) {
         if (!helpers[h] || target != helpers[h])
           continue;
-        // 入参只接受紧邻ADD；跳入BL会绕过定义，必须拒绝。
-        if (!i || flow[i].branch || !inst_is_add_imm(src[i - 1]) || !inst_get_add_imm_sf(src[i - 1])
-            || inst_get_add_imm_sh(src[i - 1]) || inst_get_add_imm_rd(src[i - 1]) != 0
-            || !(flow[i - 1].inode & (1U << inst_get_add_imm_rn(src[i - 1]))))
+        // 紧邻ADD保留旧契约；也接受已证明的inplace ADD→MOV锁入参。
+        // 直接跳入BL或绕过最后一次定义均拒绝，caller-saved仍在每个BL清空。
+        if (!i || flow[i].branch)
           return -EOPNOTSUPP;
-        int value = inst_get_add_imm_imm(src[i - 1]);
+        uint32_t previous = src[i - 1];
+        int value;
+        if (inst_is_add_imm(previous) && inst_get_add_imm_sf(previous) && !inst_get_add_imm_sh(previous)
+            && inst_get_add_imm_rd(previous) == 0
+            && (flow[i - 1].inode & (1U << inst_get_add_imm_rn(previous))))
+          value = inst_get_add_imm_imm(previous);
+        else if (inst_is_mov_reg(previous) && inst_get_mov_reg_sf(previous) && !inst_get_mov_reg_rd(previous)
+                 && inst_get_mov_reg_rm(previous) != 31
+                 && (flow[i - 1].lock & (1U << inst_get_mov_reg_rm(previous))) && (next.lock & 1U))
+          value = next.lock_offset;
+        else
+          return -EOPNOTSUPP;
         if (value < 0 || value > 0x7fff || value % 8 || (offset >= 0 && offset != value)
             || (selected >= 0 && selected != h / 2) || next.phase != (h % 2))
           return -EINVAL;
@@ -4380,6 +4404,7 @@ static int nm_find_inode_lock(const uint32_t* src, unsigned int count, int dentr
       if (inst_get_mov_reg_sf(inst) && rm != 31) {
         dent = (next.dentry >> rm) & 1U;
         inode = (next.inode >> rm) & 1U;
+        lock = (next.lock >> rm) & 1U;
       }
     } else if (inst_is_ldr_imm(inst) && !bit(inst, 26) && inst_get_ldr_imm_opc(inst) == 1) {
       rd = inst_get_ldr_imm_rt(inst);
@@ -4394,9 +4419,20 @@ static int nm_find_inode_lock(const uint32_t* src, unsigned int count, int dentr
     } else if (inst_is_stp(inst)) {
       if (inst_get_stp_mode(inst) == 1 || inst_get_stp_mode(inst) == 3)
         written = 1U << inst_get_stp_rn(inst);
+    } else if (inst_is_add_imm(inst) && inst_get_add_imm_sf(inst) && !inst_get_add_imm_sh(inst)
+               && inst_get_add_imm_rn(inst) != 31 && (next.inode & (1U << inst_get_add_imm_rn(inst)))) {
+      rd = inst_get_add_imm_rd(inst);
+      int value = inst_get_add_imm_imm(inst);
+      // 不能表示的第二种偏移保守丢弃其来源，不误伤已有锁寄存器。
+      // 直接ADD→helper的无效偏移仍由旧调用检查返回-EINVAL。
+      if (!(value % 8) && value <= 0x7fff && (!next.lock || next.lock_offset == value)) {
+        next.lock_offset = value;
+        lock = 1;
+      }
     } else if (inst_is_add_imm(inst) || inst_is_sub_imm(inst) || inst_is_orr_imm(inst) || inst_is_adrp(inst)
-               || inst_is_movz_imm(inst) || inst_is_orr_reg(inst)) {
-      // 这些指令的目的寄存器均在低5位；只MOV保留对象来源。
+               || inst_is_movz_imm(inst) || inst_is_orr_reg(inst) || inst_is_movk_imm(inst)
+               || inst_is_and_imm(inst) || inst_is_subs_imm(inst) || inst_is_csel(inst)) {
+      // 标量计算不保留指针来源；MOVK/CSEL即使涉及相同寄存器也保守清空。
       rd = bits32(inst, 4, 0);
     } else if (inst_is_paciasp(inst) || inst_is_bti_c(inst)) {
       written = 1U << 30;
@@ -4407,12 +4443,15 @@ static int nm_find_inode_lock(const uint32_t* src, unsigned int count, int dentr
       written |= 1U << rd;
       next.dentry = (next.dentry & ~written) | (dent << rd);
       next.inode = (next.inode & ~written) | (inode << rd);
+      next.lock = (next.lock & ~written) | (lock << rd);
     } else {
       next.dentry &= ~written;
       next.inode &= ~written;
+      next.lock &= ~written;
     }
     next.dentry &= 0x7fffffffU;
     next.inode &= 0x7fffffffU;
+    next.lock &= 0x7fffffffU;
     if (nm_inode_lock_merge(&flow[i + 1], next, false))
       return -EINVAL;
   }
@@ -4422,6 +4461,9 @@ static int nm_find_inode_lock(const uint32_t* src, unsigned int count, int dentr
   return offset;
 }
 
+/* 按原生三个独立来源确认同一源锁，slot为已确认setattr槽。
+ * 成功填写layout返回0；有效来源冲突或缺证据保留负错误，不按版本选择。
+ */
 static int calculate_function_setattr(struct nm_setattr_layout* layout, int slot) {
   // 当前前缀只确认plain/Android dentry入口；mapped接口由BTF确认。
   if (struct_offset.getattr_context_kind || (struct_offset.permission_abi != 0 && struct_offset.permission_abi != 1))
@@ -4447,12 +4489,28 @@ static int calculate_function_setattr(struct nm_setattr_layout* layout, int slot
     at = nm_inode_lock_body(at, start, end);
     if (!at || end - at < windows[i] * 4)
       return -EOPNOTSUPP;
+    unsigned int window = windows[i];
+    const uint32_t* entry = (const void*)at;
+    // 各新形态仅调整自身的已确认窗口，普通36/29/43条及其判据保留。
+    if (i == 0 && nm_add_at(entry[5], 29, 31, 0)
+        && nm_load_at(entry[6], 24, 0, offsetof(struct nm_dentry_head, d_inode)) && nm_move(entry[8], 22, 0))
+      window = 37;
+    else if (i == 1 && nm_add_at(entry[3], 29, 31, 0)
+             && nm_load_at(entry[4], 19, 0, offsetof(struct nm_dentry_head, d_inode)) && nm_move(entry[5], 20, 0)
+             && nm_move(entry[7], 21, 1))
+      window = 50;
+    else if (i == 2 && inst_is_sub_imm(entry[0]) && inst_get_sub_imm_sf(entry[0])
+             && inst_get_sub_imm_rd(entry[0]) == 31 && inst_get_sub_imm_rn(entry[0]) == 31
+             && inst_get_sub_imm_imm(entry[0]) == 144 && nm_add_at(entry[4], 29, 31, 96))
+      window = 39;
+    if (end - at < window * sizeof(uint32_t))
+      return -EOPNOTSUPP;
     for (unsigned int j = 0; j < i; j++)
       if (bodies[j] == at)
         return -EINVAL;  // 同一函数体别名不能算第二个来源。
     bodies[i] = at;
     int current_kind = 0;
-    int current = nm_find_inode_lock((const void*)at, windows[i], i == 2 ? 1 : 0, helpers, start, end, &current_kind);
+    int current = nm_find_inode_lock((const void*)at, window, i == 2 ? 1 : 0, helpers, start, end, &current_kind);
     nm_log_info("layout: inode lock source=%s offset=%d kind=%d\n", sources[i], current, current_kind);
     if (current < 0)
       return current;

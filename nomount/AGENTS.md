@@ -549,3 +549,10 @@ README 仅写普通用户的文件选择、界面操作和可见状态；加载�
 - 03:51日志确认三表尺寸修复已生效（inode/super/dentry为192/232/128），首个阻塞转为`nm_prepare_native`的vmalloc分类。目标没有独立`is_vmalloc_addr`；其`kvfree`没有SCS序言，16条完整函数包含两个独立恢复FP/LR并RET的出口，不匹配原14条SCS合流出口。
 - `nm_find_vmalloc_range`保留原14条契约，并增加16条形态；两组完整64位范围常量、无符号比较、分支目标和具名vfree/kfree调用全部核对后才写输出。不按版本硬填范围，RCU释放仍使用vfree_atomic/kfree，不改变原生生命周期策略。
 - 公共入口`tools/test_vmalloc_entry.py`覆盖真实16条、旧14条、常量变化、位宽/来源/分支/调用身份反例、失败输出保持及保护页；既有Oracle不改。指定Image的原生绑定与布局12阶段已宿主回放为0，不等于实际分配、注册、CFI或真机加载通过。记录见`Developer/reports/responses/2026-11-15-nomount-vmalloc-entry-repair.md`。
+
+## 2026-11-15 MIUI 源锁与首次ADD准备
+
+- 04:26已加载件的源inode锁和DAC委托仍降级；首次ADD还需延迟xattr准备，不能用ready日志证明规则可发布。问题与身份见`Developer/reports/issues/2026-11-15-nomount-0426-functional-readiness.md`，本轮不关闭原问题。
+- 源锁跟踪新增已证明的inplace ADD→64位MOV来源，caller-saved在每个BL清空，合流取交集；同一来源/锁阶段冲突拒绝。旧直接ADD及36/29/43窗口保留，目标set/remove/truncate分别按明确入口取37/50/39条；50条仅收已观察的删除入口，不统一扩大扫描。
+- 目标public xattr入口内联permission/security，未使用旧locked helper。新增37条plain5、50条plain2及40条inline listxattr3见证，核对真实源锁、参数宽度/来源、具名调用、拒绝出口与同一LSM head；不调用noperm绕过检查，不跳过ADD门禁。DAC优先确认13条直达路径，再保留39条旧形态；FASTPERM/readonly低位按实际LDRB/LDRH/LDR W核对，不据此推完整flags布局。
+- 公共`tools/test_source_lock_entries.py`覆盖真实新窗口、来源/位宽/调用/锁阶段/合流/别名冲突和保护页，以及旧直接ADD、旧readonly/DAC契约。指定Image的纯业务准备均0，实际prepare与ADD分派已在hook/路径/拓扑记录桩下达到发布调用；后段hook失败仍阻止发布。此结果不证明真实VFS、CFI、原生锁或设备功能通过，修复响应见`Developer/reports/responses/2026-11-15-nomount-business-entry-repair.md`。
