@@ -9,10 +9,11 @@
 #include <string.h>
 
 #include "re_kernel_host.h"
+#define MYKPM_VERSION "test-version"
 #define __user
 #define __aligned(n) __attribute__((aligned(n)))
 #define GFP_ATOMIC 0
-#define logkm(...) ((void)0)
+#define logkm(...) fprintf(stderr, __VA_ARGS__)
 #define kfunc(name) kf_##name
 #define kfunc_def(n) (*kf_##n)
 #define kfunc_call(n, ...) \
@@ -24,6 +25,7 @@
 #define kfunc_not_found() ((void)0)
 #define kvar(n) kv_##n
 #define lookup_name(n) n = original_genl_rcv_msg
+#define kallsyms_lookup_name_by_suffix(n) original_genl_rcv_msg
 #define kfunc_lookup_name(n) ((void)0)
 typedef uint32_t u32, __u32;
 typedef int32_t s32;
@@ -99,9 +101,9 @@ typedef struct {
   uintptr_t arg0, arg1, ret;
   int skip_origin;
 } hook_fargs2_t;
-static struct genl_family rekernel_genl_family;
-static struct genl_multicast_group rekernel_genl_mcgrp;
-static bool rekernel_genl_registered;
+static struct genl_family rekernel_genl_family, rekernel_legacy_genl_family;
+static struct genl_multicast_group rekernel_genl_mcgrp, rekernel_legacy_genl_mcgrp;
+static bool rekernel_genl_registered, rekernel_legacy_genl_registered, rekernel_genl_rcv_hooked;
 static uid_t rekernel_net_uids[32];
 static unsigned int rekernel_net_uid_count, rekernel_net_uid_guard;
 // 本测试只覆盖规则收发；缓冲读取在 cleanup 测试核对。
@@ -120,10 +122,10 @@ static void rekernel_context_unlock(unsigned int* lock, unsigned long flags) {
   assert(flags == 123);
   assert(pthread_mutex_unlock(&uid_mutex) == 0);
 }
-static unsigned char storage[512], wire[512];
+static unsigned char storage[512], wire[512], legacy_wire[512];
 static struct sk_buff buffer = {&socket, 0, 0, storage};
 static int alloc_error, header_error, nla_error, nla_calls, multicast_result;
-static int allocated, freed, sent, wire_len, cancelled;
+static int allocated, freed, sent, legacy_sent, wire_len, legacy_wire_len, cancelled;
 static int registered, unregistered, register_error, hook_error, hooked, unwrapped;
 static int original_genl_rcv_msg(struct sk_buff* skb, struct nlmsghdr* nlh) { return -777; }
 static int (*genl_rcv_msg)(struct sk_buff*, struct nlmsghdr*);
@@ -140,7 +142,7 @@ static void hook_unwrap(void* func, void* before, void* after) {
 }
 static void set_u32(void* ptr, uint32_t n) { memcpy(ptr, &n, 4); }
 static struct sk_buff* nlmsg_new(size_t size, gfp_t flags) {
-  assert(size == 264 && flags == GFP_ATOMIC);
+  assert(size > 0 && size <= sizeof(storage) && flags == GFP_ATOMIC);
   if (alloc_error)
     return NULL;
   memset(storage, 0xa5, sizeof(storage));
@@ -162,11 +164,12 @@ static void* native_genlmsg_put(struct sk_buff* skb, u32 portid, u32 seq, const 
                                 uint8_t cmd) {
   if (header_error)
     return NULL;
-  assert(!portid && !seq && !flags && cmd == 1 && family == &rekernel_genl_family);
+  assert(!portid && !flags && (cmd == REKERNEL_C_EVENT || cmd == REKERNEL_LEGACY_C_GET_VERSION)
+         && (family == &rekernel_genl_family || family == &rekernel_legacy_genl_family));
   struct nlmsghdr* nlh = (void*)skb->head;
-  *nlh = (struct nlmsghdr){.nlmsg_type = 77};
+  *nlh = (struct nlmsghdr){.nlmsg_type = family == &rekernel_genl_family ? 77 : 78, .nlmsg_seq = seq};
   struct genlmsghdr* hdr = (void*)(skb->head + 16);
-  *hdr = (struct genlmsghdr){1, 1, 0};
+  *hdr = (struct genlmsghdr){cmd, 1, 0};
   skb->tail = skb->len = 20;
   return skb->head + 20;
 }
@@ -185,25 +188,35 @@ static int native_nla_put(struct sk_buff* skb, int type, int len, const void* da
   return 0;
 }
 static int native_broadcast(struct sock* sk, struct sk_buff* skb, u32 portid, u32 group, gfp_t flags) {
-  assert(sk == &socket && skb == &buffer && !portid && group == 19 && flags == GFP_ATOMIC);
-  wire_len = skb->len;
-  memcpy(wire, skb->head, wire_len);
-  sent++;
-  freed++;  // 内核 broadcast 接管 skb，包括无订阅者和发送错误。
+  assert(sk == &socket && skb == &buffer && !portid && (group == 19 || group == 20) && flags == GFP_ATOMIC);
+  fprintf(stderr,"broadcast group=%u len=%u\\n",group,skb->len);
+  if (group == 19) {
+    wire_len = skb->len;
+    memcpy(wire, skb->head, wire_len);
+    sent++;
+  } else {
+    legacy_wire_len = skb->len;
+    memcpy(legacy_wire, skb->head, legacy_wire_len);
+    legacy_sent++;
+  }
+  freed++;
   return multicast_result;
 }
 static int native_register(struct genl_family* family) {
-  assert(hooked == 1 && family == &rekernel_genl_family);
+  assert(hooked == 1 && (family == &rekernel_genl_family || family == &rekernel_legacy_genl_family));
   struct genl_family_config* config = (void*)(family->unknow + 4);
-  assert(!strcmp(config->name, "rekernel_x2") && !config->hdrsize && config->version == 1 && config->maxattr == 49);
+  bool legacy = family == &rekernel_legacy_genl_family;
+  assert(!strcmp(config->name, legacy ? "rekernel" : "rekernel_x2") && !config->hdrsize && config->version == 1
+         && config->maxattr == (legacy ? 3 : 49));
   assert(family->unknow[0x27] == 1);
   void* group;
   memcpy(&group, family->unknow + 0x50, sizeof(group));
-  assert(group == &rekernel_genl_mcgrp && !strcmp(group, "events"));
+  assert(group == (legacy ? (void*)&rekernel_legacy_genl_mcgrp : (void*)&rekernel_genl_mcgrp)
+         && !strcmp(((struct genl_multicast_group*)group)->name, "events"));
   registered++;
   if (!register_error) {
-    set_u32(family->unknow, 77);
-    set_u32(family->unknow + 0x20, 19);
+    set_u32(family->unknow, legacy ? 78 : 77);
+    set_u32(family->unknow + 0x20, legacy ? 20 : 19);
   }
   return register_error;
 }
@@ -218,6 +231,11 @@ static void* (*kf_genlmsg_put)(struct sk_buff*, u32, u32, const struct genl_fami
 static int (*kf_nla_put)(struct sk_buff*, int, int, const void*) = native_nla_put;
 static void (*kf_skb_trim)(struct sk_buff*, unsigned int) = native_trim;
 static int (*kf_netlink_broadcast)(struct sock*, struct sk_buff*, u32, u32, gfp_t) = native_broadcast;
+static int native_unicast(struct sock* sk, struct sk_buff* skb, u32 portid, int flags) {
+  assert(sk == &socket && skb == &buffer && portid == 1234 && flags == 0x40);
+  wire_len = skb->len; memcpy(wire, skb->head, wire_len); sent++; freed++; return 0;
+}
+static int (*kf_netlink_unicast)(struct sock*, struct sk_buff*, u32, int) = native_unicast;
 static int kf___alloc_skb = 1, kf_kfree_skb = 1;
 static int kf_consume_skb;
 
@@ -341,7 +359,7 @@ static void test_sender_uid(void) {
   }
   struct nlmsghdr* nlh = command(2, 1000);
   NETLINK_CB(&buffer).creds.uid.val = 2000;
-  nlh->nlmsg_type = 78;
+  nlh->nlmsg_type = 79;
   hook_fargs2_t args = {.arg0 = (uintptr_t)&buffer, .arg1 = (uintptr_t)nlh, .ret = -777};
   genl_rcv_msg_before(&args, NULL);
   assert(!args.skip_origin && (int)args.ret == -777);
@@ -487,7 +505,7 @@ int main(void) {
   assert(start_rekernel_genl_server() == -EEXIST && !hooked && unwrapped == 1);
   register_error = 0;
   kf_genl_register_family = NULL;  // 旧内核入口 fallback。
-  assert(start_rekernel_genl_server() == 0 && hooked == 1 && registered == 2);
+  assert(start_rekernel_genl_server() == 0 && hooked == 1 && registered == 3);
   struct rekernel_event msg = {.type = BINDER,
                                .binder = {.type = TRANSACTION,
                                           .oneway = 1,
@@ -498,7 +516,7 @@ int main(void) {
                                           .code = 0xffffffff}};
   memset(msg.binder.rpc_name, 'x', 139);
   msg.binder.rpc_name[139] = 0;
-  assert(send_netlink_message(&msg) == 0 && wire_len == 228);
+  assert(send_netlink_message(&msg) == 0 && wire_len == 228 && legacy_sent == 1);
   decode_event(&msg);
   msg.binder.type = REPLY;
   msg.binder.rpc_name[0] = 0;
@@ -597,7 +615,7 @@ int main(void) {
   assert(receive(nlh) == 0 && net_uid_monitored(10042));
   assert(receive(command(3, 10042)) == 0);
   nlh = command(2, 10042);
-  nlh->nlmsg_type = 78;
+  nlh->nlmsg_type = 79;
   hook_fargs2_t args = {.arg0 = (uintptr_t)&buffer, .arg1 = (uintptr_t)nlh, .ret = -777};
   genl_rcv_msg_before(&args, NULL);
   assert(!args.skip_origin && (int)args.ret == -777 && !rekernel_net_uid_count);
@@ -628,8 +646,8 @@ int main(void) {
   assert(!rekernel_net_uid_count);
   test_rules();
   test_sender_uid();
-  assert(stop_rekernel_genl_server() == 0 && !hooked && unregistered == 1);
-  assert(stop_rekernel_genl_server() == 0 && unregistered == 1);
+  assert(stop_rekernel_genl_server() == 0 && !hooked && unregistered == 2);
+  assert(stop_rekernel_genl_server() == 0 && unregistered == 2);
   assert(send_netlink_message(&msg) == -ENOTCONN);
   puts(
       "production Genl: upstream wire bytes, nested attributes, 139-byte RPC, all write failures, skb ownership: PASS");

@@ -741,6 +741,35 @@ static long calculate_offsets() {
     if (inst_get_mov_reg_rd(word) == config_reg || inst_get_movz_imm_rd(word) == config_reg
         || inst_get_add_imm_rd(word) == config_reg)
       config_reg = -1;
+    // 同一连续 u32 字段可以合并为偏移寻址 LDP；不接受 64 位或写回参数基址的形态。
+    if (inst_is_ldp(word) && inst_get_ldp_size(word) == 0 && inst_get_ldp_mode(word) == 2
+        && (inst_get_ldp_rn(word) == 3 || inst_get_ldp_rn(word) == family_reg)
+        && inst_get_ldp_rt(word) >= 19 && inst_get_ldp_rt(word) <= 28
+        && inst_get_ldp_rt2(word) != 31 && inst_get_ldp_rt(word) != inst_get_ldp_rt2(word)
+        && inst_get_ldp_imm(word) >= 0) {
+      int header_reg = inst_get_ldp_rt2(word);
+      bool header_size = false;
+      // hdrsize 后续用于 Generic Netlink 消息头长度 hdrsize + 4，仍限制在原窗口内。
+      for (u32 j = i + 1; j < 0x19; j++) {
+        uint32_t next = genlmsg_put_src[j];
+        if (inst_is_bl(next) || inst_is_blr(next) || inst_is_ret(next))
+          break;
+        if (inst_get_add_imm_sf(next) == 0 && inst_get_add_imm_rn(next) == header_reg
+            && inst_get_add_imm_imm(next) == 4) {
+          header_size = true;
+          break;
+        }
+        if (inst_get_mov_reg_rd(next) == header_reg || inst_get_add_imm_rd(next) == header_reg
+            || inst_get_ldr_imm_uint_rt(next) == header_reg || inst_get_movz_imm_rd(next) == header_reg
+            || inst_get_ldp_rt(next) == header_reg || inst_get_ldp_rt2(next) == header_reg)
+          break;
+      }
+      if (header_size) {
+        struct_offset.genl_family_id = inst_get_ldp_imm(word);
+        struct_offset.genl_family_config = struct_offset.genl_family_id + sizeof(u32);
+        break;
+      }
+    }
     if (inst_get_ldr_imm_uint_size(word) == 0b10
         && (inst_get_ldr_imm_uint_rn(word) == 3 || inst_get_ldr_imm_uint_rn(word) == family_reg)) {
       int offset = inst_get_ldr_imm_uint_imm(word);
@@ -775,8 +804,11 @@ static long calculate_offsets() {
   logkm("genl_family_config=0x%x\n", struct_offset.genl_family_config);
 #endif /* CONFIG_DEBUG */
   if (struct_offset.genl_family_id < 0
-      || (!config_first && struct_offset.genl_family_config != struct_offset.genl_family_id + 4))
+      || (!config_first && struct_offset.genl_family_config != struct_offset.genl_family_id + 4)) {
+    logkm("Genl layout unavailable: id=%d config=%d\n", struct_offset.genl_family_id,
+          struct_offset.genl_family_config);
     return -11;
+  }
 
   // 获取 genl_family->n_mcgrps、mcgrp_offset。
   void* genlmsg_multicast_allns;
@@ -786,9 +818,19 @@ static long calculate_offsets() {
   struct_offset.genl_family_n_mcgrps = -1;
   struct_offset.genl_family_n_mcgrps_size = 0;
   struct_offset.genl_family_mcgrp_offset = -1;
+  family_reg = 0;
   for (u32 i = 0; i < 0x20; i++) {
     uint32_t word = genlmsg_multicast_allns_src[i];
-    if (inst_get_ldr_imm_uint_size(word) == 0b10 && inst_get_ldr_imm_uint_rn(word) == 0) {
+    if (inst_is_bl(word) || inst_is_blr(word) || inst_is_ret(word))
+      break;
+    if (inst_get_mov_reg_rd(word) == family_reg || inst_get_add_imm_rd(word) == family_reg
+        || inst_get_ldr_imm_uint_rt(word) == family_reg || inst_get_ldrb_imm_uint_rt(word) == family_reg)
+      family_reg = -1;
+    if (inst_get_mov_reg_sf(word) == 1 && inst_get_mov_reg_rm(word) == 0
+        && inst_get_mov_reg_rd(word) >= 19 && inst_get_mov_reg_rd(word) <= 28)
+      family_reg = inst_get_mov_reg_rd(word);
+    if (inst_get_ldr_imm_uint_size(word) == 0b10
+        && (inst_get_ldr_imm_uint_rn(word) == 0 || inst_get_ldr_imm_uint_rn(word) == family_reg)) {
       if (struct_offset.genl_family_n_mcgrps < 0) {
         struct_offset.genl_family_n_mcgrps = inst_get_ldr_imm_uint_imm(word);
         struct_offset.genl_family_n_mcgrps_size = 4;
@@ -797,7 +839,7 @@ static long calculate_offsets() {
         break;
       }
     } else if (struct_offset.genl_family_n_mcgrps < 0 && inst_is_ldrb_imm_uint(word)
-               && inst_get_ldrb_imm_uint_rn(word) == 0) {
+               && (inst_get_ldrb_imm_uint_rn(word) == 0 || inst_get_ldrb_imm_uint_rn(word) == family_reg)) {
       struct_offset.genl_family_n_mcgrps = inst_get_ldrb_imm_uint_imm(word);
       struct_offset.genl_family_n_mcgrps_size = 1;
     }
@@ -920,16 +962,36 @@ static long calculate_offsets() {
     return -11;
 
   // 获取 net->genl_sock。
-  void* genl_pernet_exit;
-  lookup_name(genl_pernet_exit);
+  void* genl_pernet_exit = (void*)kallsyms_lookup_name_by_suffix("genl_pernet_exit");
+  if (!genl_pernet_exit) {
+    logkm("Genl anchor unavailable: genl_pernet_exit\n");
+    return -21;
+  }
 
   uint32_t* genl_pernet_exit_src = (uint32_t*)genl_pernet_exit;
   struct_offset.net_genl_sock = -1;
   for (u32 i = 0; i < 0x8; i++) {
     uint32_t word = genl_pernet_exit_src[i];
     if (inst_get_ldr_imm_uint_size(word) == 0b11 && inst_get_ldr_imm_uint_rn(word) == 0
-        && inst_get_ldr_imm_uint_rt(word) == 0) {
-      struct_offset.net_genl_sock = inst_get_ldr_imm_uint_imm(word);
+        && inst_get_ldr_imm_uint_rt(word) != 31) {
+      int rt = inst_get_ldr_imm_uint_rt(word);
+      // 原有直接传参形态，以及先读临时寄存器再 CBZ 检查的 socket 读取形态。
+      if (rt == 0) {
+        struct_offset.net_genl_sock = inst_get_ldr_imm_uint_imm(word);
+        break;
+      }
+      for (u32 j = i + 1; j < i + 4 && j < 0x8; j++) {
+        uint32_t next = genl_pernet_exit_src[j];
+        if (inst_is_bl(next) || inst_is_blr(next) || inst_is_ret(next))
+          break;
+        if (inst_get_cbz_sf(next) == 1 && inst_get_cbz_rt(next) == rt) {
+          struct_offset.net_genl_sock = inst_get_ldr_imm_uint_imm(word);
+          break;
+        }
+        if (inst_get_mov_reg_rd(next) == rt || inst_get_add_imm_rd(next) == rt
+            || inst_get_ldr_imm_uint_rt(next) == rt)
+          break;
+      }
       break;
     }
     if (inst_is_bl(word) || inst_is_blr(word) || inst_is_ret(word))

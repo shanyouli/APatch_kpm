@@ -167,8 +167,9 @@ def main():
                      "genlmsg_end", "genlmsg_cancel", "nlmsg_multicast", "genlmsg_multicast_netns", "genlmsg_multicast",
                      "genl_register_family", "genl_unregister_family")),
             (source, ("free_async_update", "free_async_lookup", "free_async_has_rules",
-                      "net_uid_monitored", "net_uid_update", "rekernel_genl_rcv_msg", "genl_rcv_msg_before",
-                      "start_rekernel_genl_server", "stop_rekernel_genl_server", "send_netlink_message")),
+                      "net_uid_monitored", "net_uid_update", "rekernel_genl_rcv_msg", "rekernel_legacy_genl_rcv_msg",
+                      "genl_rcv_msg_before", "start_rekernel_genl_server", "stop_rekernel_genl_server",
+                      "send_legacy_netlink_message", "send_netlink_message")),
         ):
             import re
             for name in names:

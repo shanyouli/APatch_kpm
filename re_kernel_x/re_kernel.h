@@ -11,6 +11,7 @@
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof(arr[0]))
 
 #define REKERNEL_GENL_FAMILY_NAME "rekernel_x2"
+#define REKERNEL_LEGACY_GENL_FAMILY_NAME "rekernel"
 #define REKERNEL_GENL_VERSION 1
 #define REKERNEL_GENL_MAXATTR 49
 #define REKERNEL_GENL_MCGRP_NAME "events"
@@ -94,6 +95,15 @@ enum rekernel_genl_attr {
   REKERNEL_A_FREE_ASYNC_RPC_NAME,
   REKERNEL_A_FREE_ASYNC_CODE,
 };
+enum rekernel_legacy_genl_cmd {
+  REKERNEL_LEGACY_C_UNSPEC,
+  REKERNEL_LEGACY_C_EVENT,
+  REKERNEL_LEGACY_C_ADD_MONITOR_NET,
+  REKERNEL_LEGACY_C_DEL_MONITOR_NET,
+  REKERNEL_LEGACY_C_GET_VERSION,
+};
+enum rekernel_legacy_genl_attr { REKERNEL_LEGACY_A_UNSPEC, REKERNEL_LEGACY_A_MSG, REKERNEL_LEGACY_A_UID,
+                                 REKERNEL_LEGACY_A_PID };
 
 struct rekernel_event {
   unsigned int version;

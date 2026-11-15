@@ -47,6 +47,7 @@ void kfunc_def(skb_trim)(struct sk_buff* skb, unsigned int len);
 void kfunc_def(kfree_skb)(struct sk_buff* skb);
 void kfunc_def(consume_skb)(struct sk_buff* skb);
 int kfunc_def(netlink_broadcast)(struct sock* ssk, struct sk_buff* skb, u32 portid, u32 group, gfp_t allocation);
+int kfunc_def(netlink_unicast)(struct sock* ssk, struct sk_buff* skb, u32 portid, int nonblock);
 // start_rekernel_genl_server
 int kfunc_def(genl_register_family)(struct genl_family* family);
 int kfunc_def(__genl_register_family)(struct genl_family* family);
@@ -264,7 +265,9 @@ static bool free_async_has_rules(void) {
 
 static struct genl_family rekernel_genl_family;
 static struct genl_multicast_group rekernel_genl_mcgrp;
-static bool rekernel_genl_registered;
+static struct genl_family rekernel_legacy_genl_family;
+static struct genl_multicast_group rekernel_legacy_genl_mcgrp;
+static bool rekernel_genl_registered, rekernel_legacy_genl_registered, rekernel_genl_rcv_hooked;
 // 接收只处理本 family；返回值交给内核 netlink_rcv_skb 生成 ACK。
 static int rekernel_genl_rcv_msg(struct sk_buff* skb, struct nlmsghdr* nlh) {
   if (!skb->sk || sock_net(skb->sk) != kvar(init_net))
@@ -339,14 +342,72 @@ static int rekernel_genl_rcv_msg(struct sk_buff* skb, struct nlmsghdr* nlh) {
     return -EINVAL;
   return free_async_update(rpc_name, code, strategy, add_rule);
 }
+static int rekernel_legacy_genl_rcv_msg(struct sk_buff* skb, struct nlmsghdr* nlh) {
+  if (!skb->sk || sock_net(skb->sk) != kvar(init_net))
+    return -ENOENT;
+  if (NETLINK_CB(skb).creds.uid.val != REKERNEL_GENL_UID)
+    return -EPERM;
+  if (nlh->nlmsg_len < NLMSG_HDRLEN + GENL_HDRLEN)
+    return -EINVAL;
+  if ((nlh->nlmsg_flags & NLM_F_DUMP) == NLM_F_DUMP)
+    return -EOPNOTSUPP;
+  struct genlmsghdr* hdr = nlmsg_data(nlh);
+  if (hdr->version != REKERNEL_GENL_VERSION)
+    return -EINVAL;
+  if (hdr->cmd == REKERNEL_LEGACY_C_GET_VERSION) {
+    if (nlh->nlmsg_len != NLMSG_HDRLEN + GENL_HDRLEN || !NETLINK_CB(skb).portid)
+      return -EINVAL;
+    const char version[] = MYKPM_VERSION;
+    struct sk_buff* reply = genlmsg_new(nla_total_size(sizeof(version) - 1), rekernel_gfp_atomic);
+    if (!reply)
+      return -ENOMEM;
+    void* reply_hdr = kfunc(genlmsg_put)(reply, 0, nlh->nlmsg_seq, &rekernel_legacy_genl_family, 0,
+                                         REKERNEL_LEGACY_C_GET_VERSION);
+    if (!reply_hdr || kfunc(nla_put)(reply, REKERNEL_LEGACY_A_MSG, sizeof(version) - 1, version)) {
+      if (reply_hdr)
+        genlmsg_cancel(reply, reply_hdr);
+      else
+        nlmsg_free(reply);
+      return -ENOMEM;
+    }
+    genlmsg_end(reply, reply_hdr);
+    return kfunc(netlink_unicast)(net_genl_sock(kvar(init_net)), reply, NETLINK_CB(skb).portid, 0x40);
+  }
+  if (hdr->cmd != REKERNEL_LEGACY_C_ADD_MONITOR_NET && hdr->cmd != REKERNEL_LEGACY_C_DEL_MONITOR_NET)
+    return -EOPNOTSUPP;
+  unsigned int left = nlh->nlmsg_len - NLMSG_HDRLEN - GENL_HDRLEN;
+  struct nlattr* attr = (void*)((char*)hdr + GENL_HDRLEN);
+  uid_t uid = 0;
+  bool has_uid = false;
+  while (left) {
+    if (left < NLA_HDRLEN || attr->nla_len != NLA_HDRLEN + sizeof(uid) || attr->nla_len > left
+        || attr->nla_type != REKERNEL_LEGACY_A_UID)
+      return -EINVAL;
+    if (has_uid)
+      return -EINVAL;
+    memcpy(&uid, nla_data(attr), sizeof(uid));
+    has_uid = true;
+    unsigned int len = NLA_ALIGN(attr->nla_len);
+    if (len > left)
+      return -EINVAL;
+    left -= len;
+    attr = (void*)((char*)attr + len);
+  }
+  return has_uid ? net_uid_update(uid, hdr->cmd == REKERNEL_LEGACY_C_ADD_MONITOR_NET) : -EINVAL;
+}
+
 static void genl_rcv_msg_before(hook_fargs2_t* args, void* udata) {
   struct sk_buff* skb = (struct sk_buff*)args->arg0;
   struct nlmsghdr* nlh = (struct nlmsghdr*)args->arg1;
-  if (!__atomic_load_n(&rekernel_genl_registered, __ATOMIC_ACQUIRE)
-      || nlh->nlmsg_type != genl_family_id(&rekernel_genl_family))
-    return;
-  args->skip_origin = 1;
-  args->ret = rekernel_genl_rcv_msg(skb, nlh);
+  if (nlh->nlmsg_type == genl_family_id(&rekernel_genl_family)
+      && __atomic_load_n(&rekernel_genl_registered, __ATOMIC_ACQUIRE)) {
+    args->skip_origin = 1;
+    args->ret = rekernel_genl_rcv_msg(skb, nlh);
+  } else if (nlh->nlmsg_type == genl_family_id(&rekernel_legacy_genl_family)
+             && __atomic_load_n(&rekernel_legacy_genl_registered, __ATOMIC_ACQUIRE)) {
+    args->skip_origin = 1;
+    args->ret = rekernel_legacy_genl_rcv_msg(skb, nlh);
+  }
 }
 // 静态内存块清零、填写配置，再交给内核注册。
 static int start_rekernel_genl_server(void) {
@@ -354,14 +415,18 @@ static int start_rekernel_genl_server(void) {
   if (!kfunc(genl_register_family))
     kfunc_lookup_name(__genl_register_family);
   kfunc_lookup_name(genl_unregister_family);
-  lookup_name(genl_rcv_msg);
+  genl_rcv_msg = (typeof(genl_rcv_msg))kallsyms_lookup_name_by_suffix("genl_rcv_msg");
+  if (!genl_rcv_msg) {
+    logkm("Init failed: stage=genl symbol=genl_rcv_msg missing\n");
+    return -21;
+  }
   if (!kfunc(kfree_skb) && !kfunc(consume_skb)) {
     logkm("SKB release unavailable: kfree_skb / consume_skb\n");
     return -EOPNOTSUPP;
   }
   if ((!kfunc(genl_register_family) && !kfunc(__genl_register_family)) || !kfunc(genl_unregister_family)
       || !kfunc(__alloc_skb) || !kfunc(genlmsg_put) || !kfunc(nla_put) || !kfunc(skb_trim) || !kfunc(netlink_broadcast)
-      || !kvar(init_net))
+      || !kfunc(netlink_unicast) || !kvar(init_net))
     return -EOPNOTSUPP;
 
   struct genl_family* family = &rekernel_genl_family;
@@ -377,27 +442,113 @@ static int start_rekernel_genl_server(void) {
          struct_offset.genl_family_n_mcgrps_size);
   memcpy(rekernel_genl_mcgrp.name, REKERNEL_GENL_MCGRP_NAME, sizeof(REKERNEL_GENL_MCGRP_NAME));
 
+  struct genl_family* legacy = &rekernel_legacy_genl_family;
+  struct genl_family_config* legacy_config = genl_family_config(legacy);
+  memset(legacy, 0, sizeof(*legacy));
+  memset(&rekernel_legacy_genl_mcgrp, 0, sizeof(rekernel_legacy_genl_mcgrp));
+  memcpy(legacy_config->name, REKERNEL_LEGACY_GENL_FAMILY_NAME, sizeof(REKERNEL_LEGACY_GENL_FAMILY_NAME));
+  legacy_config->version = REKERNEL_GENL_VERSION;
+  legacy_config->maxattr = 3;
+  *(struct genl_multicast_group**)((uintptr_t)legacy + struct_offset.genl_family_mcgrps) =
+      &rekernel_legacy_genl_mcgrp;
+  memcpy((void*)((uintptr_t)legacy + struct_offset.genl_family_n_mcgrps), &n_mcgrps,
+         struct_offset.genl_family_n_mcgrps_size);
+  memcpy(rekernel_legacy_genl_mcgrp.name, REKERNEL_GENL_MCGRP_NAME, sizeof(REKERNEL_GENL_MCGRP_NAME));
+
   int rc = hook_wrap(genl_rcv_msg, 2, genl_rcv_msg_before, NULL, NULL);
   if (rc)
     return -EOPNOTSUPP;
+  rekernel_genl_rcv_hooked = true;
   rc = genl_register_family(family);
   if (rc) {
     hook_unwrap(genl_rcv_msg, genl_rcv_msg_before, NULL);
+    rekernel_genl_rcv_hooked = false;
     return rc;
   }
   __atomic_store_n(&rekernel_genl_registered, true, __ATOMIC_RELEASE);
-  logkm("Created Re:Kernel Generic Netlink family! ID: %d\n", genl_family_id(family));
+  rc = genl_register_family(legacy);
+  if (rc) {
+    __atomic_store_n(&rekernel_genl_registered, false, __ATOMIC_RELEASE);
+    int unregister_rc = genl_unregister_family(family);
+    hook_unwrap(genl_rcv_msg, genl_rcv_msg_before, NULL);
+    rekernel_genl_rcv_hooked = false;
+    if (unregister_rc)
+      logkm("Failed to rollback ReKernel-X family: %d\n", unregister_rc);
+    return rc;
+  }
+  __atomic_store_n(&rekernel_legacy_genl_registered, true, __ATOMIC_RELEASE);
+  logkm("Created ReKernel-X family ID=%d and legacy rekernel family ID=%d\n", genl_family_id(family),
+        genl_family_id(legacy));
   return 0;
 }
 static int stop_rekernel_genl_server(void) {
-  if (!__atomic_load_n(&rekernel_genl_registered, __ATOMIC_ACQUIRE))
-    return 0;
-  int rc = genl_unregister_family(&rekernel_genl_family);
-  if (rc)
-    return rc;
-  __atomic_store_n(&rekernel_genl_registered, false, __ATOMIC_RELEASE);
-  hook_unwrap(genl_rcv_msg, genl_rcv_msg_before, NULL);
+  if (__atomic_load_n(&rekernel_legacy_genl_registered, __ATOMIC_ACQUIRE)) {
+    int rc = genl_unregister_family(&rekernel_legacy_genl_family);
+    if (rc)
+      return rc;
+    __atomic_store_n(&rekernel_legacy_genl_registered, false, __ATOMIC_RELEASE);
+  }
+  if (__atomic_load_n(&rekernel_genl_registered, __ATOMIC_ACQUIRE)) {
+    int rc = genl_unregister_family(&rekernel_genl_family);
+    if (rc)
+      return rc;
+    __atomic_store_n(&rekernel_genl_registered, false, __ATOMIC_RELEASE);
+  }
+  if (rekernel_genl_rcv_hooked) {
+    hook_unwrap(genl_rcv_msg, genl_rcv_msg_before, NULL);
+    rekernel_genl_rcv_hooked = false;
+  }
   return 0;
+}
+static int send_legacy_netlink_message(const struct rekernel_event* msg) {
+  if (!__atomic_load_n(&rekernel_legacy_genl_registered, __ATOMIC_ACQUIRE))
+    return 0;
+  char text[PACKET_SIZE];
+  int length;
+  if (msg->type == NETWORK) {
+    length = snprintf(text, sizeof(text), "type=Network,target=%u,proto=ipv%u,data_len=%u;", msg->network.uid,
+                      msg->network.family, msg->network.data_len);
+  } else if (msg->type == SIGNAL) {
+    length = snprintf(text, sizeof(text), "type=Signal,signal=%u,killer_pid=%u,killer=%u,dst_pid=%u,dst=%u;",
+                      msg->signal.signum, msg->signal.src_pid, msg->signal.src_uid, msg->signal.dst_pid,
+                      msg->signal.dst_uid);
+  } else if (msg->type == BINDER && msg->binder.type <= OVERFLOW) {
+    static const char* const types[] = {"reply", "transaction", "free_buffer_full"};
+    if (msg->binder.oneway && msg->binder.type == TRANSACTION) {
+      length = snprintf(text, sizeof(text),
+                        "type=Binder,bindertype=%s,oneway=%u,from_pid=%u,from=%u,target_pid=%u,target=%u,"
+                        "rpc_name=%s,code=%u;",
+                        types[msg->binder.type], msg->binder.oneway, msg->binder.src_pid, msg->binder.src_uid,
+                        msg->binder.dst_pid, msg->binder.dst_uid, msg->binder.rpc_name, msg->binder.code);
+    } else {
+      length = snprintf(text, sizeof(text),
+                        "type=Binder,bindertype=%s,oneway=%u,from_pid=%u,from=%u,target_pid=%u,target=%u;",
+                        types[msg->binder.type], msg->binder.oneway, msg->binder.src_pid, msg->binder.src_uid,
+                        msg->binder.dst_pid, msg->binder.dst_uid);
+    }
+  } else {
+    return -EINVAL;
+  }
+  if (length < 0 || length >= sizeof(text))
+    return -EMSGSIZE;
+  struct sk_buff* skb = genlmsg_new(nla_total_size(length), rekernel_gfp_atomic);
+  if (!skb)
+    return -ENOMEM;
+  void* hdr = kfunc(genlmsg_put)(skb, 0, 0, &rekernel_legacy_genl_family, 0, REKERNEL_LEGACY_C_EVENT);
+  if (!hdr || kfunc(nla_put)(skb, REKERNEL_LEGACY_A_MSG, length, text)) {
+    if (hdr)
+      genlmsg_cancel(skb, hdr);
+    else
+      nlmsg_free(skb);
+    return -EMSGSIZE;
+  }
+  genlmsg_end(skb, hdr);
+  unsigned int group = genl_family_mcgrp_offset(&rekernel_legacy_genl_family);
+  logkm("Legacy send: len=%d group=%u registered=%d\n", length, group,
+        __atomic_load_n(&rekernel_legacy_genl_registered, __ATOMIC_ACQUIRE));
+  int rc = kfunc(netlink_broadcast)(net_genl_sock(kvar(init_net)), skb, 0, group, rekernel_gfp_atomic);
+  logkm("Legacy broadcast rc=%d\n", rc);
+  return rc == -ESRCH ? 0 : rc;
 }
 // 内部事件转换为上游嵌套 attributes，发送到 events 组播组。
 static int send_netlink_message(const struct rekernel_event* msg) {
@@ -466,7 +617,11 @@ static int send_netlink_message(const struct rekernel_event* msg) {
   nla_nest_end(skb, event);
   genlmsg_end(skb, hdr);
   int rc = genlmsg_multicast(&rekernel_genl_family, skb, 0, 0, rekernel_gfp_atomic);
-  return rc == -ESRCH ? 0 : rc;
+  rc = rc == -ESRCH ? 0 : rc;
+  int legacy_rc = send_legacy_netlink_message(msg);
+  if (legacy_rc)
+    logkm("Legacy rekernel event delivery failed: %d\n", legacy_rc);
+  return rc;
 nla_fail:
   genlmsg_cancel(skb, hdr);
   nlmsg_free(skb);
@@ -1072,6 +1227,7 @@ static long inline_hook_init(const char* args, const char* event, void* __user r
   if (!kfunc(kfree_skb))
     kfunc_lookup_name(consume_skb);
   kfunc_lookup_name(netlink_broadcast);
+  kfunc_lookup_name(netlink_unicast);
 
   kvar_lookup_name(init_net);
   kfunc_lookup_name(tracepoint_probe_register);
@@ -1125,8 +1281,15 @@ static long inline_hook_init(const char* args, const char* event, void* __user r
 
   kfunc_lookup_name(sock_i_uid);
 
-  lookup_name(tcp_v4_do_rcv);
-  lookup_name(tcp_v6_do_rcv);
+  // CFI/LTO 可能只保留带 $hash 或 .llvm 后缀的函数名，复用 KP 的原名优先查询。
+  tcp_v4_do_rcv = (typeof(tcp_v4_do_rcv))kallsyms_lookup_name_by_suffix("tcp_v4_do_rcv");
+  tcp_v6_do_rcv = (typeof(tcp_v6_do_rcv))kallsyms_lookup_name_by_suffix("tcp_v6_do_rcv");
+  logkm("TCP hooks: tcp_v4_do_rcv=%llx tcp_v6_do_rcv=%llx\n", (uint64_t)tcp_v4_do_rcv,
+        (uint64_t)tcp_v6_do_rcv);
+  if (!tcp_v4_do_rcv || !tcp_v6_do_rcv) {
+    logkm("Init failed: stage=tcp_symbols ipv4=%d ipv6=%d\n", !!tcp_v4_do_rcv, !!tcp_v6_do_rcv);
+    return -21;
+  }
 #ifdef CONFIG_DEBUG_CMDLINE
   kfunc_lookup_name(get_cmdline);
 #endif /* CONFIG_DEBUG_CMDLINE */
