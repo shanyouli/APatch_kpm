@@ -98,6 +98,7 @@ int kfunc_def(get_cmdline)(struct task_struct* task, char* buffer, int buflen);
 #endif /* CONFIG_DEBUG_CMDLINE */
 
 static bool trace;
+static bool business_hooked[4];
 static struct tracepoint* binder_vendor_record;
 static bool binder_vendor_record_registered, binder_proc_hooked;
 static gfp_t rekernel_gfp_atomic = GFP_ATOMIC;
@@ -998,7 +999,63 @@ static void binder_cleanup_hook_exit(void) {
   }
 }
 
+// 每个状态仅表示本模块成功安装的回调；退出不能解除其它模块的 hook 链。
+static int install_business_hook(void* target, int argc, void* before, void* after, void* data,
+                                 unsigned int index, const char* name) {
+  if (!target) {
+    logkm("Init failed: hook=%s symbol missing\n", name);
+    return -ENOENT;
+  }
+  hook_err_t err = hook_wrap(target, argc, before, after, data);
+  if (err) {
+    logkm("Init failed: hook=%s hook_error=%d\n", name, err);
+    return -23;
+  }
+  business_hooked[index] = true;
+  return 0;
+}
+
+static void remove_business_hooks(void) {
+  if (business_hooked[3]) {
+    hook_unwrap(tcp_v6_do_rcv, tcp_rcv_before, NULL);
+    business_hooked[3] = false;
+  }
+  if (business_hooked[2]) {
+    hook_unwrap(tcp_v4_do_rcv, tcp_rcv_before, NULL);
+    business_hooked[2] = false;
+  }
+  if (business_hooked[1]) {
+    hook_unwrap(do_send_sig_info, do_send_sig_info_before, NULL);
+    business_hooked[1] = false;
+  }
+  if (business_hooked[0]) {
+    hook_unwrap(binder_transaction, binder_transaction_before, binder_transaction_after);
+    business_hooked[0] = false;
+  }
+}
+
+static int install_business_hooks(void) {
+  int rc = install_business_hook(binder_transaction, 5, binder_transaction_before, binder_transaction_after,
+                                 NULL, 0, "binder_transaction");
+  if (!rc)
+    rc = install_business_hook(do_send_sig_info, 4, do_send_sig_info_before, NULL, NULL, 1, "do_send_sig_info");
+  if (!rc)
+    rc = install_business_hook(tcp_v4_do_rcv, 2, tcp_rcv_before, NULL, &ipv4_version, 2, "tcp_v4_do_rcv");
+  if (!rc)
+    rc = install_business_hook(tcp_v6_do_rcv, 2, tcp_rcv_before, NULL, &ipv6_version, 3, "tcp_v6_do_rcv");
+  if (rc)
+    remove_business_hooks();
+  return rc;
+}
+
 static long inline_hook_init(const char* args, const char* event, void* __user reserved) {
+  logkm("Init version=%s mode=%s event=%s\n", MYKPM_VERSION,
+#ifdef CONFIG_KPM_BASELINES
+        "static",
+#else
+        "dynamic",
+#endif
+        event ? event : "");
 #ifdef CONFIG_KPM_BASELINES
   if (struct_offset.binder_release_abi < 3 || struct_offset.binder_release_abi > 6) {
     logkm("Invalid Binder release ABI: %d\n", struct_offset.binder_release_abi);
@@ -1077,8 +1134,10 @@ static long inline_hook_init(const char* args, const char* event, void* __user r
   int rc = 0;
 #ifndef CONFIG_KPM_BASELINES
   rc = calculate_offsets();
-  if (rc)
+  if (rc) {
+    logkm("Init failed: stage=offsets rc=%d\n", rc);
     return rc;
+  }
 #endif
   if (!kfunc(binder_alloc_copy_from_buffer)) {
     if (struct_offset.binder_buffer_data >= 0)
@@ -1093,27 +1152,28 @@ static long inline_hook_init(const char* args, const char* event, void* __user r
       trace = true;
   }
 
-  hook_func(binder_transaction, 5, binder_transaction_before, binder_transaction_after, NULL);
-  hook_func(do_send_sig_info, 4, do_send_sig_info_before, NULL, NULL);
-
-  hook_func(tcp_v4_do_rcv, 2, tcp_rcv_before, NULL, &ipv4_version);
-  hook_func(tcp_v6_do_rcv, 2, tcp_rcv_before, NULL, &ipv6_version);
+  rc = install_business_hooks();
+  if (rc)
+    goto rollback;
 
   rc = start_rekernel_genl_server();
+  if (rc)
+    logkm("Init failed: stage=genl rc=%d\n", rc);
   // 厂商回调注册成功后直接完成 init，不再增加可能失败的初始化步骤。
-  if (!rc)
+  if (!rc) {
     rc = binder_cleanup_hook_init();
+    if (rc)
+      logkm("Init failed: stage=binder_cleanup rc=%d\n", rc);
+  }
+rollback:
   if (rc) {
-    stop_rekernel_genl_server();
     binder_cleanup_hook_exit();
+    stop_rekernel_genl_server();
     if (trace) {
       tracepoint_probe_unregister(kvar(__tracepoint_binder_transaction), rekernel_binder_transaction, NULL);
       trace = false;
     }
-    hook_unwrap(binder_transaction, binder_transaction_before, binder_transaction_after);
-    hook_unwrap(do_send_sig_info, do_send_sig_info_before, NULL);
-    hook_unwrap(tcp_v4_do_rcv, tcp_rcv_before, NULL);
-    hook_unwrap(tcp_v6_do_rcv, tcp_rcv_before, NULL);
+    remove_business_hooks();
   }
   return rc;
 }
@@ -1130,14 +1190,11 @@ static long inline_hook_exit(void* __user reserved) {
   int rc = stop_rekernel_genl_server();
   if (rc)
     logkm("Failed to unregister Generic Netlink family: %d\n", rc);
-  if (trace)
+  if (trace) {
     tracepoint_probe_unregister(kvar(__tracepoint_binder_transaction), rekernel_binder_transaction, NULL);
-
-  unhook_func(binder_transaction);
-  unhook_func(do_send_sig_info);
-
-  unhook_func(tcp_v4_do_rcv);
-  unhook_func(tcp_v6_do_rcv);
+    trace = false;
+  }
+  remove_business_hooks();
 
   return 0;
 }
