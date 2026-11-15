@@ -20,7 +20,7 @@
 
 ## 打包与发布
 
-- 上游 nm、WebUI、metainstall、路径处理与许可证取自冻结 gitlink；包中保留 `sources/`、许可证和署名，KPM 与 ZIP 分别绑定完整 source_commit、instance_id 和 SHA-256。
+- 上游 nm、WebUI、metainstall、路径处理与许可证由主仓库直接跟踪，初始来源见 `../upstream/SOURCE.json`；构建从主仓库同一冻结提交读取，包中保留 `sources/`、许可证和署名，KPM 与 ZIP 分别绑定完整 source_commit、instance_id 和 SHA-256。清单中的 upstream_commit 仅记录初始上游来源，不再用于访问嵌套仓库。
 - `build_zip.py` 从干净冻结提交及固定 NDK 构建 ZIP；输出 `NoMount-kpm_<版本>.zip`，归档仍放每次新实例目录，版本由 module.prop、Build ID 和清单表达。
 - `release_zip.py` 的 `PACKAGE` 从 module.prop 的版本生成 `NoMount-kpm_<版本>.zip`，发布副本清单在实际 ZIP 名后追加 `.json`，更新入口仍为 `NoMount-kpm.json`；下载 URL 绑定发布标签与实际文件名，用户 README 使用 `NoMount-kpm.zip` 简写。
 - README 更新记录的第一条必须为当前发布版本；打包器直接对完整 history 执行版本一致性断言。文档说明合并到当前版本条目，ZIP 内 CHANGELOG 提取该版本内容，全部既有版本条目保留。

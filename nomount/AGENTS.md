@@ -6,7 +6,7 @@
 
 - 首轮目标为用户提供的 `boot_los23.2.img`，内核版本 `4.19.325-cip134-st18-perf-g7fc8455b2fa8`。
 - 下一轮目标为 `B2N-416G_boot.img`（4.4.192-perf+）。参考 Nokia SDM660 提交 `67c3e103decafc3ff8a361c39f079a0dfce2a23c` 的声明与目标配置；参考源码为4.4.196，不能声明为镜像的准确构建源码。变化字段另以目标机器码交叉核对。
-- 以 `UPSTREAM.md` 指定的 Git 提交为原版源码基线。上游 Git 子模块位于 `nomount/upstream/nomount`；移植代码在本目录单独维护。
+- 以 `UPSTREAM.md` 指定的 Git 提交为原版源码基线。来源快照以普通文件纳入主仓库的 `nomount/upstream/nomount`，不再使用子模块；初始来源记录在 `nomount/upstream/SOURCE.json`，移植代码在本目录单独维护。
 - 首轮内核源码参考为 `LineageOS/android_kernel_sony_sm8250` 的 `7fc8455b2fa84be76364c2457e6503b867ceb12a`，与镜像版本标记一致。源码用于核对字段语义，运行时偏移仍取自目标。
 - 普通文件、目录枚举、APK 资源和映射访问共用一致的规则。PackageManager 的扫描成功不代表应用进程读取成功。
 - 模块成功初始化后驻留到重启，与 zram_zstd 保持一致；不实现热卸载和已发布回调的撤销。exit 只作诊断，不能把其返回值当成 KP 卸载保护。
@@ -63,7 +63,7 @@ git archive <迁移前提交> nomount/configs | tar -x -C local
 - `nm_control.c`：控制命令、批次游标、规则与 UID 管理以及规则列表分页。
 - `nm_control_key.c`：keyring 预解析载荷与 key_type 注册；成功后驻留。
 - `nm_control_entry.c`：实际 KPM 包含的完整 backing 与控制层入口，先准备引擎和锁，最后注册 key type。
-- `module/`：配套ZIP自有安装与启动脚本；上游用户态、WebUI、metainstall及路径处理仍从冻结子模块读取。
+- `module/`：配套ZIP自有安装与启动脚本；上游用户态、WebUI、metainstall及路径处理从主仓库跟踪的来源快照读取。
 - `tools/build_zip.py`：从干净冻结提交打包ZIP，直接用NDK编译上游nm；记录独立ZIP实例、工具／输入及产物哈希，不重建KPM。
 - `tools/test_zip_module.py`：临时目录执行安装与启动脚本，以CLI／安装器夹具验证控制流，不能代替实机。
 - VFS、规则管理和控制接口按业务拆分，避免把目标布局混进规则实现。
@@ -317,7 +317,7 @@ Android boot 输入按 boot 头的 kernel 段长度截取后解压。arm64 头�
 
 - 版本采用上游元模块版本加本轮日期，与 rek/rekx 格式一致。KPM Makefile、NM_KPM_VERSION 和 ZIP version 同步；ZIP versionCode 使用 YYYYMMDD，保持普通整数范围。
 - ZIP 文件及显示名为 NoMount-kpm，内部 id/keyring 类型仍为 nomount；用户可覆盖更新已有安装。KPM 管理名称保持 NoMount。
-- Actions 分别构建 KPM 和配套 ZIP，再由统一发布任务收集。ZIP 使用固定 NDK 26.3.11579264，在 Linux runner 显式指定 linux-x86_64；build_zip 从同次干净提交和冻结 gitlink 读取实际输入。
+- Actions 分别构建 KPM 和配套 ZIP，再由统一发布任务收集。ZIP 使用固定 NDK 26.3.11579264，在 Linux runner 显式指定 linux-x86_64；build_zip 从主仓库同次干净提交读取实际输入，初始上游身份只作来源记录。
 - release_zip.py 负责发布目录的 ZIP 副本、独立清单及哈希；合并发布前核对 KPM/ZIP 的完整 source_commit 和 NoMount 版本。最终 SHA256SUMS 包括两类发布文件，BUILD_MANIFEST 保留 KPM 信息并追加 companion 引用。
 - 用户侧安装／VFS业务保持现状；本轮只更改版本字符串、配套显示名、打包文件名和发布流程。已有审计／实机结论绑定旧实例，新实例需经轻量差异复核后由维护者验收。
 

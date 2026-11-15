@@ -19,7 +19,7 @@ on:
       - "nomount/module/**"
       - "nomount/README.md"
       - "nomount/tools/**"
-      - "nomount/upstream/nomount"
+      - "nomount/upstream/**"
       - "zram_zstd/upstream/zstd"
       - "KernelPatch"
       - ".gitmodules"
@@ -42,7 +42,7 @@ on:
       - "nomount/module/**"
       - "nomount/README.md"
       - "nomount/tools/**"
-      - "nomount/upstream/nomount"
+      - "nomount/upstream/**"
       - "zram_zstd/upstream/zstd"
       - "KernelPatch"
       - ".gitmodules"
@@ -244,6 +244,8 @@ jobs:
 
       - name: Check ZIP publishing
         run: |
+          python3 nomount/tools/test_zip_inputs.py
+          python3 nomount/tools/test_webui_rules.py
           python3 nomount/tools/test_release_zip.py
           python3 nomount/tools/test_update_json.py
 

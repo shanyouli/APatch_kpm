@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/maxsteeel/nomount",
+  "revision": "bf1847f98fed382369c43bfd652cd93774b9b8e3",
+  "version": "v2.2.0",
+  "management": "vendored",
+  "licenses": {
+    "companion": "GPL-3.0-only",
+    "kernel_reference": "GPL-2.0-only"
+  }
+}

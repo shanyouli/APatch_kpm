@@ -1,6 +1,6 @@
 # 来源、署名与许可证
 
-原版 NoMount 作者为 **maxsteeel**。本 ZIP 使用其 GPL-3 用户态工具、元模块路径处理及 WebUI，基于提交 `bf1847f98fed382369c43bfd652cd93774b9b8e3`（v2.2.0）。
+原版 NoMount 作者为 **maxsteeel**。本 ZIP 使用其 GPL-3 用户态工具、元模块路径处理及 WebUI，基于提交 `bf1847f98fed382369c43bfd652cd93774b9b8e3`（v2.2.0）。这些源码现由当前主仓库直接跟踪，不依赖 Git 子模块；包内 `sources/UPSTREAM.json` 保留初始来源，实际构建绑定主仓库提交与逐文件哈希。
 
 **Codex（OpenAI）**完成 KPM 移植及配套 ZIP 改造；这里记录 AI 开发贡献。原作者及其他贡献者的署名保留，未将此署名作为新增的版权归属声明。
 

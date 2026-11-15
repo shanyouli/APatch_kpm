@@ -37,8 +37,8 @@ def check_cli(data):
     assert any(p[0] == 1 and p[1] & 1 and p[3] <= entry < p[3] + p[6] for p in segments)
 
 
-def adapt_webui(js):
-    """适配生成副本的连接状态、彩蛋与规则路径解析。"""
+def adapt_webui(js, rules_js=None):
+    """适配生成副本的连接状态、彩蛋、路径解析与运行时规则管理。"""
     before = 'if ${NM_BIN} version > /dev/null 2>&1; then lsmod | grep -q nomount && echo lkm || echo built-in; fi'
     assert js.count(before) == 1
     js = js.replace(before, 'if ${NM_BIN} version > /dev/null 2>&1; then echo api; fi')
@@ -114,7 +114,15 @@ async function loadModule(modId) { await runModuleRules(modId, true); }'''
         pattern = r'(?ms)^async function ' + name + r'\(modId\) \{.*?^\}'
         assert len(re.findall(pattern, js)) == 1, name
         js = re.sub(pattern, lambda _: replacement, js, count=1)
-    return js
+    before = "    const listContainer = document.getElementById('modules-list');"
+    assert js.count(before) == 1
+    js = js.replace(before, '    await nmRefreshRules();\n' + before, 1)
+    before = '    const updateModuleCardDOM = async (card, modId) => {'
+    assert js.count(before) == 1
+    js = js.replace(before, before + '\n        await nmRefreshRules();', 1)
+    if rules_js is None:
+        rules_js = (Path(__file__).resolve().parents[1] / 'module/webui-rules.js').read_text()
+    return js + '\n' + rules_js
 
 
 def adapt_rule_paths(body):
@@ -155,8 +163,8 @@ def adapt_cli(body):
     assert body.count(before) == 1
     body = body.replace(before, 'if ((args.target_uid || args.target_uid_end) && '
                         '(args.deny_start < args.target_uid || args.deny_end > args.target_uid_end)) {', 1)
-    before = '    switch (args.action) {'
-    assert body.count(before) == 1
+    before_probe = '    switch (args.action) {'
+    assert body.count(before_probe) == 1
     probe = '''    /* KPM companion: verify wire ABI before any non-version operation. */
     if (args.action != ACTION_NONE && args.action != ACTION_VERSION) {
         payload->cmd = NM_CMD_GET_VERSION;
@@ -172,7 +180,27 @@ def adapt_cli(body):
     }
 
 '''
-    return body.replace(before, probe + before, 1)
+    replacements = {
+        '    int p_count = 0, needs_cwd = 0;': '    int p_count = 0, needs_cwd = 0, virtual_dir = 0;',
+        'else if (strcmp(argv[i], "--whiteout") == 0) { args.is_whiteout = 1; }':
+            'else if (strcmp(argv[i], "--virtual-dir") == 0) { virtual_dir = 1; }\n            '
+            'else if (strcmp(argv[i], "--whiteout") == 0) { args.is_whiteout = 1; }',
+        'args.action == ACTION_RULE_ADD && args.is_whiteout && args.is_opaque':
+            'args.action == ACTION_RULE_ADD && args.is_whiteout + args.is_opaque + virtual_dir > 1',
+        'nm: --whiteout and --opaque flags are mutually exclusive':
+            'nm: --whiteout, --virtual-dir and --opaque flags are mutually exclusive',
+        'int step = (args.action == ACTION_RULE_ADD && !args.is_whiteout) ? 2 : 1;':
+            'int step = (args.action == ACTION_RULE_ADD && !args.is_whiteout && !virtual_dir) ? 2 : 1;',
+        'if (args.action == ACTION_RULE_ADD && !args.is_whiteout) {':
+            'if (args.action == ACTION_RULE_ADD && !args.is_whiteout && !virtual_dir) {',
+        '(args.is_whiteout ? 4 : 0)': '(args.is_whiteout ? 4 : 0) | (virtual_dir ? 3 : 0)',
+        '  nm rule del <virtual_path>':
+            '  nm rule add --virtual-dir <virtual_path>  Add a virtual directory\\n"\n        "  nm rule del <virtual_path>',
+    }
+    for before, after in replacements.items():
+        assert body.count(before) == 1, before
+        body = body.replace(before, after, 1)
+    return body.replace(before_probe, probe + before_probe, 1)
 
 
 def zip_changelog(data, version):
@@ -195,6 +223,42 @@ def zip_changelog(data, version):
     return ('\n'.join(section).strip() + '\n').encode()
 
 
+def collect_zip_inputs(root, commit):
+    """仅从主仓库指定 Git 对象读取 ZIP 输入，不依赖嵌套仓库。"""
+    prefix = 'nomount/upstream/nomount/'
+    provenance_path = 'nomount/upstream/SOURCE.json'
+    paths = ['nomount/module', 'nomount/tools/build_zip.py', 'nomount/tools/build_nm.sh', provenance_path]
+    paths += [prefix + path for path in ('module/webroot', 'module/metainstall.sh',
+                                       'module/rule-paths.sh', 'userspace/src', 'LICENSE')]
+    inputs, contents, sources = {}, {}, {}
+    for path in tree_files(root, commit, *paths):
+        data = git(root, 'show', commit + ':' + path)
+        inputs[path] = sha(data)
+        if path.startswith('nomount/module/'):
+            contents[path.removeprefix('nomount/module/')] = data
+        elif path == 'nomount/tools/build_nm.sh':
+            contents['sources/build-nm.sh'] = data
+        elif path == provenance_path:
+            contents['sources/UPSTREAM.json'] = data
+        elif path.startswith(prefix):
+            relative = path.removeprefix(prefix)
+            if relative.startswith('module/'):
+                contents[relative.removeprefix('module/')] = data
+            elif relative.startswith('userspace/src/'):
+                sources[Path(relative).name] = data
+            elif relative == 'LICENSE':
+                contents['LICENSE'] = data
+    required = {'sources/UPSTREAM.json', 'sources/build-nm.sh', 'module.prop',
+                'LICENSE', 'webroot/index.js', 'webroot/index.html', 'webroot/styles.css',
+                'metainstall.sh', 'rule-paths.sh', 'webui-rules.js'}
+    if not required <= contents.keys() or not {'nm.c', 'nm.h'} <= sources.keys():
+        raise ValueError('ZIP 源码输入不完整')
+    provenance = json.loads(contents['sources/UPSTREAM.json'])
+    if provenance['management'] != 'vendored' or not re.fullmatch(r'[0-9a-f]{40}', provenance['revision']):
+        raise ValueError('上游来源记录无效')
+    return inputs, contents, sources, provenance['revision']
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--ndk', type=Path, required=True)
@@ -202,43 +266,18 @@ def main():
     parser.add_argument('--toolchain', default='ndk26.3.11579264')
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
-    upstream = root / 'nomount/upstream/nomount'
     commit = git(root, 'rev-parse', 'HEAD').decode().strip()
     if git(root, 'status', '--porcelain'):
         parser.error('候选必须从干净冻结提交构建。')
-    row = git(root, 'ls-tree', commit, 'nomount/upstream/nomount').decode().split()
-    assert row[:2] == ['160000', 'commit']
-    upstream_commit = row[2]
-    assert git(upstream, 'rev-parse', 'HEAD').decode().strip() == upstream_commit
-    assert not git(upstream, 'status', '--porcelain')
-    inputs = {}
-    contents = {}
-    for path in tree_files(root, commit, 'nomount/module', 'nomount/tools/build_zip.py', 'nomount/tools/build_nm.sh'):
-        data = git(root, 'show', commit + ':' + path)
-        inputs[path] = sha(data)
-        if path.startswith('nomount/module/'):
-            contents[path.removeprefix('nomount/module/')] = data
-        elif path == 'nomount/tools/build_nm.sh':
-            contents['sources/build-nm.sh'] = data
-    upstream_paths = tree_files(upstream, upstream_commit, 'module/webroot', 'module/metainstall.sh', 'module/rule-paths.sh', 'userspace/src', 'LICENSE')
-    sources = {}
-    for path in upstream_paths:
-        data = git(upstream, 'show', upstream_commit + ':' + path)
-        inputs['nomount/upstream/nomount/' + path] = sha(data)
-        if path.startswith('module/'):
-            contents[path.removeprefix('module/')] = data
-        elif path.startswith('userspace/src/'):
-            sources[Path(path).name] = data
-        elif path == 'LICENSE':
-            contents['LICENSE'] = data
+    inputs, contents, sources, upstream_commit = collect_zip_inputs(root, commit)
 
     sources['nm.c'] = adapt_cli(sources['nm.c'].decode()).encode()
     contents['rule-paths.sh'] = ('# SPDX-License-Identifier: GPL-3.0-only\n'
                                 '# NoMount by maxsteeel; nonempty opaque handling adapted by Codex, 2026-11-08.\n'
                                 + adapt_rule_paths(contents['rule-paths.sh'].decode())).encode()
 
-    # 对输出副本适配状态展示，冻结上游保持原字节。
-    js = adapt_webui(contents['webroot/index.js'].decode())
+    # 对输出副本适配状态展示，仓库内来源快照保持原字节。
+    js = adapt_webui(contents['webroot/index.js'].decode(), contents.pop('webui-rules.js').decode())
     contents['webroot/index.js'] = ('// SPDX-License-Identifier: GPL-3.0-only\n'
                                   '// NoMount by maxsteeel; connection, rule paths and operation status adapted by Codex, 2026-11-08.\n' + js).encode()
     for name in list(contents):
@@ -278,8 +317,6 @@ def main():
     check_cli(contents['bin/nm'])
     assert not git(root, 'status', '--porcelain')
     assert git(root, 'rev-parse', 'HEAD').decode().strip() == commit
-    assert git(upstream, 'rev-parse', 'HEAD').decode().strip() == upstream_commit
-    assert not git(upstream, 'status', '--porcelain')
     assert {name: sha((tool_bin / name).read_bytes()) for name in tool_hashes} == tool_hashes
     package = output / f'NoMount-kpm_{version}.zip'
     with zipfile.ZipFile(package, 'x', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:

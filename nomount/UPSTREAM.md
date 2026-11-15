@@ -15,7 +15,7 @@ KPM 的内核实现整体沿用 GPL-2.0-only；线协议取自 GPL-2 的 `kernel
 
 原作者：maxsteeel。KPM 移植与配套改造：Codex（OpenAI，AI 开发贡献）。上游其他贡献者的署名保留；配套修改范围和日期见 [来源说明](module/NOTICE.md)。
 
-Git 子模块位于 `nomount/upstream/nomount`，由父仓库 gitlink 冻结上述提交。接入建议见 [补丁](../Developer/proposals/2026-10-12-nomount-upstream/submodule.patch)。
+上游来源快照位于 `nomount/upstream/nomount`，已纳入父仓库作为普通文件管理，不再使用 Git 子模块。初始来源记录在 [upstream/SOURCE.json](upstream/SOURCE.json)，实际构建输入由主仓库冻结提交及逐文件哈希绑定；历史 gitlink 身份保留在各自历史提交中。
 
 ## KPM 移植与配套适配
 
@@ -24,7 +24,7 @@ Git 子模块位于 `nomount/upstream/nomount`，由父仓库 gitlink 冻结上�
   KPM 保留自身完整操作表快照及驻留生命周期。
 - 同步 v22 的 UID 范围、排除范围和 opaque 目录语义；规则仍使用本仓库的独立引用与进程上下文退役模型。
 - ZIP 中的 CLI 生成副本增加 v22 协议探测，并修正上游默认规则单独使用 `--uid-excluded` 时的范围检查。
-  冻结子模块不修改，实际构建的适配后源码与编译脚本随 ZIP 提供。
+  来源快照的原版字节保留，实际构建的适配后源码与编译脚本随 ZIP 提供。
 - 2026-11-08：选择性回移 `95cf3d013d4dfd888708df124c8a25aaf7ac2ebc` 的虚拟 inode
   SUID/SGID 清除语义，统一新建、属性返回、setattr 同步及缓存匹配。
   配套生成副本回移 `71883de7ab2e2468bbbaf78ef64ac44a33069531` 的非空 opaque 目录处理，
