@@ -1,0 +1,1933 @@
+/*
+ * Audit and filter SELinux access queries that probe Magisk contexts.
+ *
+ * Transaction queries are filtered at the direct selinuxfs write handlers,
+ * where /sys/fs/selinux/access and /sys/fs/selinux/context still have the
+ * original query text.  procattr writes are filtered at selinux_setprocattr().
+ * Returning -EINVAL for Magisk contexts matches the clean-policy behavior
+ * where the Magisk type/context does not exist.
+ */
+
+#include <linux/kernel.h>
+#include <linux/printk.h>
+#include <linux/sched.h>
+#include <linux/fs.h>
+#include <linux/err.h>
+#include <asm/current.h>
+#include <asm-generic/rwonce.h>
+#include <uapi/asm-generic/errno.h>
+#include <uapi/asm-generic/fcntl.h>
+#include <uapi/linux/fs.h>
+#include <security.h>
+#include <ksyms.h>
+#include <hook.h>
+#include <kpmodule.h>
+#include <kputils.h>
+
+KPM_NAME("selinux_MAF_fork");
+KPM_VERSION("1.1.9.2");
+KPM_LICENSE("GPL v3");
+KPM_AUTHOR("Admire, 741afb7");
+KPM_DESCRIPTION("SELinux MAF target adaptation; check mode and status before use");
+#ifdef CONFIG_KPM_BASELINES
+KPM_INFO(offset_mode, "static", 16);
+#else
+KPM_INFO(offset_mode, "dynamic", 16);
+#endif
+
+#define ACCESS_SAMPLE_MAX 256
+#define ACCESS_PROBE_SLOTS 32
+#define CLEAN_POLICYDB_ALLOC_SIZE 0x4000
+#define SELINUX_LEGACY_BLOB_QUERY_MAX VERSION(4, 15, 0)
+#define contains_case_literal(s, len, lit) contains_case_lit((s), (len), (lit), sizeof(lit) - 1)
+
+#define MAGISK_POLICY_PATH "/.magisk/selinux/load"
+#define MAGISK_POLICY_REL_PATH ".magisk/selinux/load"
+#define MAGISK_POLICY_MAX_SIZE (8 * 1024 * 1024)
+#define CLEAN_EVAL_SCOPE_SLOTS 8
+#define SELINUX_STATUS_SIZE 20
+#define SELINUX_STATUS_CLEAN_SEQUENCE 4
+#define SELINUX_STATUS_CLEAN_POLICYLOAD 1
+#define KP_AVD_CLEAN_SEQNO 1
+#define selinux_hook_dbg(fmt, ...) pr_info(fmt, ##__VA_ARGS__)
+
+typedef enum {
+    SEL_HOOK_STATE_NORMAL = 0,
+    SEL_HOOK_STATE_POLICYDB_REQ,
+    SEL_HOOK_STATE_UNSUPORRT
+} sel_hook_state_t;
+
+static void *g_funcs[24];
+static void *g_hook_befores[24];
+static void *g_hook_afters[24];
+static int g_hooks;
+static long (*copy_from_kernel_nofault_fn)(void *dst, const void *src, size_t size);
+static int (*security_load_policy_fn)(void *data, size_t len, struct selinux_load_state *load_state);
+static int (*security_context_to_sid_fn)(const char *scontext, u32 scontext_len, u32 *out_sid, gfp_t gfp);
+static int (*security_context_to_sid_compat_fn)(void *state, const char *scontext, u32 scontext_len,
+                                                u32 *out_sid, gfp_t gfp);
+struct policydb;
+struct policy_file {
+    char *data;
+    size_t len;
+};
+
+static int (*policydb_read_fn)(struct policydb *policydb, struct policy_file *fp);
+static void (*policydb_destroy_fn)(struct policydb *policydb);
+static void *(*vmalloc_fn)(unsigned long size);
+static void *(*vmalloc_to_page_fn)(const void *addr);
+static void (*vfree_fn)(const void *addr);
+static struct file *(*filp_open_fn)(const char *filename, int flags, umode_t mode);
+static int (*filp_close_fn)(struct file *filp, fl_owner_t id);
+static ssize_t (*kernel_read_fn)(struct file *file, void *buf, size_t count, loff_t *pos);
+static loff_t (*vfs_llseek_fn)(struct file *file, loff_t offset, int whence);
+static void *g_selinux_state;
+
+static bool g_selinux_ready;
+static bool g_dirty_policy_seen;
+static void *g_first_policydb;
+static u32 g_clean_access_count;
+static void *g_clean_policy_blob;
+static size_t g_clean_policy_len;
+static bool g_clean_policy_has_magisk;
+static bool g_clean_policydb_direct;
+static void *g_clean_policydb;
+static u32 g_clean_eval_depth;
+static u32 g_selinux_setprocattr_probe_count;
+static bool g_policy_capture_in_progress;
+static bool g_status_open_redirect_hooked;
+static void *g_status_open;
+static int g_policy_error = -EAGAIN;
+static bool g_queries_hooked;
+static bool g_compute_hooked;
+static bool g_string_hooked;
+
+struct struct_offset {
+    int16_t file_private_data;
+};
+volatile struct struct_offset struct_offset __attribute__((section(".data.re_offsets"), used)) = {
+#ifdef CONFIG_KPM_BASELINES
+    .file_private_data = 0xc8,
+#else
+    .file_private_data = -1,
+#endif
+};
+
+struct access_probe {
+    u32 id;
+    uid_t uid;
+    const char *node;
+    char query[ACCESS_SAMPLE_MAX];
+};
+
+struct clean_eval_scope {
+    void *task;
+    u32 depth;
+};
+
+static struct access_probe g_probes[ACCESS_PROBE_SLOTS];
+static struct clean_eval_scope g_clean_eval_scopes[CLEAN_EVAL_SCOPE_SLOTS];
+static unsigned char g_clean_status_bytes[SELINUX_STATUS_SIZE];
+static void *g_fake_status_page;
+
+/* Spinlock guards for the scope arrays.  We do not use DEFINE_SPINLOCK +
+ * spin_lock() because the running kernel on this device does not export
+ * _raw_spin_lock/_raw_spin_unlock through the kfunc ksymtab; the wrapper
+ * expands to kf__raw_spin_lock/unknown.  Resolve the raw helpers via
+ * kallsyms at init (mirroring vmalloc/vfree/etc.) and call them through
+ * a function pointer, matching the convention used elsewhere in this
+ * module. */
+typedef void (*raw_spin_lock_fn_t)(raw_spinlock_t *lock);
+typedef void (*raw_spin_unlock_fn_t)(raw_spinlock_t *lock);
+static raw_spin_lock_fn_t g_raw_spin_lock_fn;
+static raw_spin_unlock_fn_t g_raw_spin_unlock_fn;
+static raw_spinlock_t g_scopes_lock = { .raw_lock = ATOMIC_INIT(0) };
+
+static bool contains_magisk(const char *s, size_t len);
+static bool contains_case_lit(const char *s, size_t len, const char *lit, size_t lit_len);
+static bool should_bypass_clean_filter(uid_t uid);
+static const char *current_comm(void);
+static bool use_legacy_clean_blob_query(void);
+static bool clean_policydb_redirect_supported(void);
+static bool selinux_state_arg_required(void);
+static bool selinux_compat_call_needed(void);
+static void resolve_required_symbols_once(void);
+static void *lookup_name_optional_suffix(const char *base);
+static void log_symbol_addr(const char *name, const void *addr);
+static void zero_bytes(void *dst, size_t len);
+static bool snapshot_magisk_policy_file(const char *reason, bool try_relative);
+static bool finish_deferred_policy_capture(hook_fargs4_t *a, const char *stage, bool allow_fallback);
+static void before_security_load_policy(hook_fargs4_t *a, void *u);
+static void after_security_load_policy(hook_fargs4_t *a, void *u);
+static void try_load_clean_policydb_from_blob(const char *reason);
+static bool enter_clean_eval_scope(void);
+static void leave_clean_eval_scope(void);
+static bool current_in_clean_eval_scope(void);
+static int install_write_op_hooks(void);
+static void record_inline_hook(void *func, void *before, void *after);
+static void uninstall_inline_hooks(void);
+static void after_sel_open_handle_status(hook_fargs2_t *a, void *u);
+static bool install_status_page_redirect(void);
+
+/*
+ * Patch the seqno field (5th whitespace-separated token, formatted as "%u")
+ * in a /sys/fs/selinux/access response buffer to new_seqno.
+ * Format: "%x %x %x %x %u %x"
+ * Returns the new length (may differ if decimal widths differ).
+ */
+static ssize_t patch_response_seqno(char *buf, ssize_t ret, u32 new_seqno)
+{
+    char *p = buf;
+    char *end = buf + ret;
+    char *tok_start;
+    char new_str[12];
+    int ns_len;
+    int tok;
+    ssize_t diff;
+
+    if (ret <= 0 || !buf)
+        return ret;
+
+    /* Skip 4 space-separated tokens to reach the 5th (seqno) */
+    for (tok = 0; tok < 4; tok++) {
+        while (p < end && *p == ' ') p++;
+        while (p < end && *p != ' ') p++;
+    }
+    while (p < end && *p == ' ') p++;
+    tok_start = p;
+    while (p < end && *p != ' ' && *p != '\0' && *p != '\n') p++;
+
+    if (tok_start >= p)
+        return ret;
+
+    /* Render new_seqno as decimal */
+    {
+        u32 v = new_seqno;
+        int i = 0;
+        char tmp[12];
+        if (v == 0) {
+            new_str[0] = '0';
+            ns_len = 1;
+        } else {
+            while (v > 0) { tmp[i++] = '0' + (v % 10); v /= 10; }
+            for (ns_len = 0; ns_len < i; ns_len++)
+                new_str[ns_len] = tmp[i - 1 - ns_len];
+        }
+    }
+
+    diff = (ssize_t)ns_len - (ssize_t)(p - tok_start);
+    if (diff != 0) {
+        /* Shift the remainder of the string left or right */
+        char *dst = tok_start + ns_len;
+        char *src = p;
+        size_t move = (size_t)(end - src);
+        int j;
+        if (diff < 0) {
+            for (j = 0; j < (int)move; j++) dst[j] = src[j];
+        } else {
+            for (j = (int)move - 1; j >= 0; j--) dst[j] = src[j];
+        }
+        ret += diff;
+    }
+
+    {
+        int k;
+        for (k = 0; k < ns_len; k++)
+            tok_start[k] = new_str[k];
+    }
+    return ret;
+}
+
+static void copy_bytes(void *dst, const void *src, size_t len)
+{
+    size_t i;
+    volatile char *d = (volatile char *)dst;
+    const volatile char *s = (const volatile char *)src;
+
+    if (!d || !s)
+        return;
+
+    for (i = 0; i < len; i++)
+        d[i] = s[i];
+}
+
+static void zero_bytes(void *dst, size_t len)
+{
+    size_t i;
+    volatile char *d = (volatile char *)dst;
+
+    if (!d)
+        return;
+
+    for (i = 0; i < len; i++)
+        d[i] = 0;
+}
+
+static size_t runtime_page_size(void)
+{
+    uint64_t tcr_el1;
+    uint64_t tg1;
+
+    /* Match KernelPatch's runtime page-size detection for the TTBR1 range. */
+    asm volatile("mrs %0, tcr_el1" : "=r"(tcr_el1));
+    tg1 = (tcr_el1 >> 30) & 0x3;
+
+    if (tg1 == 1)
+        return 16 * 1024;
+    if (tg1 == 3)
+        return 64 * 1024;
+    return 4 * 1024;
+}
+
+static void put_u32_le(unsigned char *dst, u32 value)
+{
+    if (!dst)
+        return;
+
+    dst[0] = (unsigned char)(value & 0xff);
+    dst[1] = (unsigned char)((value >> 8) & 0xff);
+    dst[2] = (unsigned char)((value >> 16) & 0xff);
+    dst[3] = (unsigned char)((value >> 24) & 0xff);
+}
+
+static u32 get_u32_le(const unsigned char *src)
+{
+    if (!src)
+        return 0;
+
+    return (u32)src[0] |
+           ((u32)src[1] << 8) |
+           ((u32)src[2] << 16) |
+           ((u32)src[3] << 24);
+}
+
+static void fill_clean_status_bytes(unsigned char *status)
+{
+    u32 seq, pload;
+
+    if (!status)
+        return;
+
+    /* kernel >= 6.6: detection expects sequence=4 policyload=1
+     * kernel <  6.6: detection expects sequence=0 policyload=0
+     * (Java isNewKernel() uses >= 6.10 as threshold, we use 6.6 to
+     *  be safe and avoid false positives on kernels in between)
+     */
+    if (kver >= VERSION(6, 7, 0)) {
+        seq   = SELINUX_STATUS_CLEAN_SEQUENCE;
+        pload = SELINUX_STATUS_CLEAN_POLICYLOAD;
+    } else {
+        seq   = 0;
+        pload = 0;
+    }
+
+    zero_bytes(status, SELINUX_STATUS_SIZE);
+    put_u32_le(status + 0,  1);
+    put_u32_le(status + 4,  seq);
+    put_u32_le(status + 8,  1);    /* enforcing — always 1 */
+    put_u32_le(status + 12, pload);
+    put_u32_le(status + 16, 1);
+}
+
+static bool buffer_contains_magisk(const char *buf, size_t len)
+{
+    return contains_magisk(buf, len);
+}
+
+static bool ascii_lower_eq(char a, char b)
+{
+    if (a >= 'A' && a <= 'Z')
+        a = a - 'A' + 'a';
+    if (b >= 'A' && b <= 'Z')
+        b = b - 'A' + 'a';
+    return a == b;
+}
+
+static bool str_eq_lit(const char *s, const char *lit)
+{
+    size_t i;
+
+    if (!s || !lit)
+        return false;
+
+    for (i = 0; lit[i]; i++) {
+        if (s[i] != lit[i])
+            return false;
+    }
+
+    return s[i] == '\0';
+}
+
+static const char *current_comm(void)
+{
+    if (task_struct_offset.comm_offset <= 0)
+        return "?";
+
+    return get_task_comm(current) ?: "?";
+}
+
+static bool should_bypass_clean_filter(uid_t uid)
+{
+    if (uid < 10000)
+        return true;
+
+    return false;
+}
+
+static bool use_legacy_clean_blob_query(void)
+{
+    return kver < SELINUX_LEGACY_BLOB_QUERY_MAX;
+}
+
+static bool clean_policydb_redirect_supported(void)
+{
+    /*
+     * 4.14 reference basis:
+     *   - https://github.com/balgxmr/kernel_xiaomi_cepheus/tree/sixteen
+     *   - https://github.com/LineageOS/android_kernel_xiaomi_sm8150/tree/lineage-22.2
+     *   - https://android.googlesource.com/kernel/common/+/refs/heads/deprecated/android-4.14-stable
+     *
+     * Relevant source paths:
+     *   - security/selinux/ss/services.c
+     *       context_struct_compute_av(struct policydb *policydb, ...)
+     *       security_context_to_sid(struct selinux_state *state, ...)
+     *       security_load_policy(struct selinux_state *state, ...)
+     *   - security/selinux/selinuxfs.c
+     *       sel_write_access(), sel_write_context()
+     *
+     * 这里的 4.14 适配不是单纯按 kver 猜 ABI，而是用上述 cepheus/sm8150
+      * 4.14 源码确认 SELinux helper 的真实签名。只要运行时能解析到
+      * selinux_state，就认为它符合这组 4.14 stateful SELinux 布局；否则
+      * policydb redirect 保持关闭，避免把参数强套到未知布局上。
+     *
+     * The Xiaomi sm8150/cepheus 4.14 lineage keeps selinux_state and also uses
+     * the policydb-argument context_struct_compute_av() signature.  Therefore
+     * selinux_state is the runtime confidence signal for using the 4.14
+     * stateful SELinux helper signatures and the 6-argument policydb redirect
+      * path. Kernels older than this baseline do not install policydb hooks.
+     */
+    return !use_legacy_clean_blob_query() || g_selinux_state;
+}
+
+static bool selinux_compat_call_needed(void)
+{
+    /*
+     * 4.14 参考源码里的 security_context_to_sid() 需要
+     * struct selinux_state * 作为第一个参数。这里用 selinux_state
+     * 作为运行时信号，避免在没有 stateful ABI 的旧内核上误传参数。
+     *
+     * security_context_to_sid() is stateful on the 4.14 sources listed above.
+     * Keep the state argument through the Android common stateful era, and stop
+     * before the newer 6.4+ LSM refactors where this KPM has not been audited.
+     */
+	return g_selinux_state && selinux_state_arg_required();
+}
+
+static bool selinux_state_arg_required(void)
+{
+    return kver >= VERSION(4, 14, 0) && kver < VERSION(6, 4, 0);
+}
+
+struct symbol_cache_entry {
+    const char *base;
+    size_t len;
+    unsigned long addr;
+    bool exact;
+    bool suffixed;
+};
+
+typedef int (*kallsyms_on_each_symbol_nomod_fn)(int (*fn)(void *, const char *, unsigned long),
+                                                void *data);
+
+#define SYMBOL_CACHE_ENTRY(name) { name, 0, 0, false, false }
+
+static struct symbol_cache_entry g_symbol_cache[] = {
+    SYMBOL_CACHE_ENTRY("_raw_spin_lock"),
+    SYMBOL_CACHE_ENTRY("_raw_spin_unlock"),
+    SYMBOL_CACHE_ENTRY("copy_from_kernel_nofault"),
+    SYMBOL_CACHE_ENTRY("probe_kernel_read"),
+    SYMBOL_CACHE_ENTRY("vmalloc"),
+    SYMBOL_CACHE_ENTRY("vmalloc_noprof"),
+    SYMBOL_CACHE_ENTRY("vmalloc_to_page"),
+    SYMBOL_CACHE_ENTRY("vfree"),
+    SYMBOL_CACHE_ENTRY("filp_open"),
+    SYMBOL_CACHE_ENTRY("filp_close"),
+    SYMBOL_CACHE_ENTRY("kernel_read"),
+    SYMBOL_CACHE_ENTRY("vfs_llseek"),
+    SYMBOL_CACHE_ENTRY("selinux_state"),
+    SYMBOL_CACHE_ENTRY("security_load_policy"),
+    SYMBOL_CACHE_ENTRY("security_context_to_sid"),
+    SYMBOL_CACHE_ENTRY("policydb_read"),
+    SYMBOL_CACHE_ENTRY("policydb_destroy"),
+    SYMBOL_CACHE_ENTRY("flex_array_get"),
+    SYMBOL_CACHE_ENTRY("avtab_search_node"),
+    SYMBOL_CACHE_ENTRY("avtab_search_node_next"),
+    SYMBOL_CACHE_ENTRY("cond_compute_av"),
+    SYMBOL_CACHE_ENTRY("constraint_expr_eval"),
+    SYMBOL_CACHE_ENTRY("type_attribute_bounds_av"),
+    SYMBOL_CACHE_ENTRY("selinux_kernel_status_page"),
+    SYMBOL_CACHE_ENTRY("sel_open_handle_status"),
+    SYMBOL_CACHE_ENTRY("sel_read_handle_status"),
+    SYMBOL_CACHE_ENTRY("sel_mmap_handle_status"),
+    SYMBOL_CACHE_ENTRY("selinux_setprocattr"),
+    SYMBOL_CACHE_ENTRY("sel_write_access"),
+    SYMBOL_CACHE_ENTRY("sel_write_context"),
+    SYMBOL_CACHE_ENTRY("context_struct_compute_av"),
+    SYMBOL_CACHE_ENTRY("string_to_context_struct"),
+    SYMBOL_CACHE_ENTRY("selinux_complete_init"),
+    SYMBOL_CACHE_ENTRY("selinux_policy_commit"),
+};
+
+#define SYMBOL_CACHE_COUNT (sizeof(g_symbol_cache) / sizeof(g_symbol_cache[0]))
+
+static bool g_symbol_cache_resolved;
+static bool g_symbol_cache_walk_complete;
+
+static size_t str_len_safe(const char *s)
+{
+    const volatile char *p;
+    size_t len = 0;
+
+    if (!s)
+        return 0;
+
+    /* Keep this as an explicit byte walk so clang/gcc does not fold it into an
+     * out-of-line strlen() libcall, which is unavailable in the KPM loader. */
+    p = (const volatile char *)s;
+    while (p[len])
+        len++;
+    return len;
+}
+
+static bool suffix_contains_cfi(const char *suffix)
+{
+    size_t i;
+
+    if (!suffix)
+        return false;
+
+    for (i = 0; suffix[i]; i++) {
+        if (suffix[i] == 'c' && suffix[i + 1] == 'f' && suffix[i + 2] == 'i' &&
+            (i == 0 || suffix[i - 1] == '.' || suffix[i - 1] == '$') &&
+            (!suffix[i + 3] || suffix[i + 3] == '.' || suffix[i + 3] == '$'))
+            return true;
+    }
+    return false;
+}
+
+static bool symbol_name_matches(const char *name, const char *base, size_t len)
+{
+    size_t i;
+
+    if (!name || !base)
+        return false;
+
+    for (i = 0; i < len; i++) {
+        if (name[i] != base[i])
+            return false;
+    }
+
+    return name[len] == '\0';
+}
+
+static bool symbol_has_compiler_suffix(const char *name, const char *base, size_t len)
+{
+    size_t i;
+
+    if (!name || !base || !len)
+        return false;
+
+    for (i = 0; i < len; i++) {
+        if (name[i] != base[i])
+            return false;
+    }
+
+    if (!(name[len] == '.' || name[len] == '$') || !name[len + 1])
+        return false;
+
+    /* Skip CFI stub variants; they redirect to the real function */
+    if (suffix_contains_cfi(name + len + 1))
+        return false;
+
+    return true;
+}
+
+static void prepare_symbol_cache(void)
+{
+    size_t i;
+
+    for (i = 0; i < SYMBOL_CACHE_COUNT; i++)
+        g_symbol_cache[i].len = str_len_safe(g_symbol_cache[i].base);
+}
+
+static void cache_symbol_match(const char *name, unsigned long addr)
+{
+    size_t i;
+
+    if (!name || !addr)
+        return;
+
+    for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
+        struct symbol_cache_entry *entry = &g_symbol_cache[i];
+
+        if (!entry->base || !entry->len || entry->exact)
+            continue;
+
+        if (symbol_name_matches(name, entry->base, entry->len)) {
+            entry->addr = addr;
+            entry->exact = true;
+            entry->suffixed = false;
+            continue;
+        }
+
+        if (!entry->addr &&
+            symbol_has_compiler_suffix(name, entry->base, entry->len)) {
+            entry->addr = addr;
+            entry->suffixed = true;
+        }
+    }
+}
+
+static int cache_symbol_cb(void *data, const char *name,
+                           struct module *module, unsigned long addr)
+{
+    (void)data;
+    (void)module;
+
+    cache_symbol_match(name, addr);
+    return 0;
+}
+
+static int cache_symbol_cb_nomod(void *data, const char *name, unsigned long addr)
+{
+    (void)data;
+
+    cache_symbol_match(name, addr);
+    return 0;
+}
+
+static void resolve_required_symbols_once(void)
+{
+    size_t i;
+    u32 found = 0;
+    u32 suffixed = 0;
+    u32 missing = 0;
+    int walk_rc = -ENOENT;
+    bool walk_complete = false;
+
+    if (READ_ONCE(g_symbol_cache_resolved))
+        return;
+
+    prepare_symbol_cache();
+
+    if (!kallsyms_on_each_symbol) {
+        pr_warn("[selinux_hook] kallsyms_on_each_symbol missing; falling back to exact symbol lookups only\n");
+        for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
+            unsigned long addr;
+
+            addr = (unsigned long)kallsyms_lookup_name(g_symbol_cache[i].base);
+            if (addr) {
+                g_symbol_cache[i].addr = addr;
+                g_symbol_cache[i].exact = true;
+            }
+        }
+    } else if (kver <= VERSION(6, 1, 0)) {
+        walk_rc = kallsyms_on_each_symbol(cache_symbol_cb, NULL);
+    } else {
+        kallsyms_on_each_symbol_nomod_fn on_each_symbol;
+
+        on_each_symbol = (kallsyms_on_each_symbol_nomod_fn)kallsyms_on_each_symbol;
+        walk_rc = on_each_symbol(cache_symbol_cb_nomod, NULL);
+    }
+
+	for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
+        if (g_symbol_cache[i].addr) {
+            found++;
+            if (g_symbol_cache[i].suffixed)
+                suffixed++;
+        }
+    }
+    walk_complete = walk_rc == 0 && found > 0;
+
+    if (found == 0 && kallsyms_on_each_symbol) {
+        pr_warn("[selinux_hook] kallsyms_on_each_symbol returned no symbols, falling back to kallsyms_lookup_name\n");
+        for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
+            unsigned long addr;
+            addr = (unsigned long)kallsyms_lookup_name(g_symbol_cache[i].base);
+            if (addr) {
+                g_symbol_cache[i].addr = addr;
+                g_symbol_cache[i].exact = true;
+            }
+        }
+    }
+
+    found = 0;
+    suffixed = 0;
+    missing = 0;
+    for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
+        if (g_symbol_cache[i].addr) {
+            found++;
+            if (g_symbol_cache[i].suffixed)
+                suffixed++;
+        } else {
+            missing++;
+        }
+    }
+
+    WRITE_ONCE(g_symbol_cache_walk_complete, walk_complete);
+    WRITE_ONCE(g_symbol_cache_resolved, true);
+    pr_info("[selinux_hook] symbol cache resolved in one pass: found=%u suffixed=%u missing=%u\n",
+            found, suffixed, missing);
+}
+
+static struct symbol_cache_entry *find_cached_symbol(const char *base)
+{
+    size_t i;
+
+    if (!base)
+        return NULL;
+
+    for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
+        if (str_eq_lit(base, g_symbol_cache[i].base))
+            return &g_symbol_cache[i];
+    }
+
+    return NULL;
+}
+
+static void *lookup_name_optional_suffix(const char *base)
+{
+    struct symbol_cache_entry *entry;
+    unsigned long addr;
+
+    if (!base)
+        return NULL;
+
+    resolve_required_symbols_once();
+
+    entry = find_cached_symbol(base);
+    if (entry && entry->addr)
+        return (void *)entry->addr;
+
+    addr = (unsigned long)kallsyms_lookup_name(base);
+    if (addr && entry) {
+        entry->addr = addr;
+        entry->exact = true;
+        entry->suffixed = false;
+    }
+
+    return (void *)addr;
+}
+
+/*
+ * Some LTO kernels expose context_struct_compute_av only as a numbered local
+ * symbol (for example context_struct_compute_av.72).  Keep this expensive
+ * fallback out of the generic lookup path: when kallsyms_on_each_symbol is
+ * unusable, probing 256 names for every missing cache entry can stall the
+ * synchronous pre-kernel-init KPM loader.
+ */
+static void *lookup_name_numbered_suffix(const char *base)
+{
+    struct symbol_cache_entry *entry;
+    unsigned long addr;
+    char name[64];
+    volatile char *name_bytes = (volatile char *)name;
+    const volatile char *base_bytes = (const volatile char *)base;
+    size_t base_len;
+    size_t i;
+    size_t pos;
+    u32 n;
+
+    if (!base)
+        return NULL;
+
+    resolve_required_symbols_once();
+
+    if (READ_ONCE(g_symbol_cache_walk_complete))
+        return NULL;
+
+    base_len = str_len_safe(base);
+    /* Dot, up to three decimal digits, and the trailing NUL. */
+    if (!base_len || base_len + 5 > sizeof(name))
+        return NULL;
+
+    /* Volatile byte copies keep clang from lowering this into an unresolved
+     * out-of-line memcpy() call in the freestanding KPM image. */
+    for (i = 0; i < base_len; i++)
+        name_bytes[i] = base_bytes[i];
+
+    for (n = 0; n < 256; n++) {
+        pos = base_len;
+        name[pos++] = '.';
+        if (n >= 100)
+            name[pos++] = '0' + (n / 100) % 10;
+        if (n >= 10)
+            name[pos++] = '0' + (n / 10) % 10;
+        name[pos++] = '0' + n % 10;
+        name[pos] = '\0';
+
+        addr = (unsigned long)kallsyms_lookup_name(name);
+        if (addr) {
+            entry = find_cached_symbol(base);
+            if (entry) {
+                entry->addr = addr;
+                entry->exact = false;
+                entry->suffixed = true;
+            }
+            pr_info("[selinux_hook] resolved %s as %s addr=%px\n",
+                    base, name, (void *)addr);
+            return (void *)addr;
+        }
+    }
+
+    return NULL;
+}
+
+static void log_symbol_addr(const char *name, const void *addr)
+{
+    pr_info("[selinux_hook] symbol %-36s %s addr=%px\n",
+            name ?: "(null)", addr ? "found" : "missing", addr);
+}
+
+static ssize_t call_kernel_read_file(struct file *file, void *buf, size_t count, loff_t *pos)
+{
+    if (!kernel_read_fn)
+        return -ENOENT;
+
+    if (kver < VERSION(4, 14, 0)) {
+        loff_t offset = pos ? *pos : 0;
+        int (*kernel_read_legacy)(struct file *file, loff_t offset, char *addr,
+                                  unsigned long count) =
+            (void *)kernel_read_fn;
+        int rc = kernel_read_legacy(file, offset, (char *)buf,
+                                    (unsigned long)count);
+
+        if (pos && rc > 0)
+            *pos = offset + rc;
+        return rc;
+    }
+
+    return kernel_read_fn(file, buf, count, pos);
+}
+
+static bool snapshot_policy_file_path(const char *path, const char *source,
+                                      const char *reason)
+{
+    struct file *filp;
+    void *data;
+    loff_t len;
+    loff_t pos;
+    ssize_t nread;
+
+    if (!vmalloc_fn)
+        return false;
+    if (!filp_open_fn || !filp_close_fn || !kernel_read_fn || !vfs_llseek_fn) {
+        pr_warn("[selinux_hook] CLEAN Magisk policy file read disabled reason=%s open=%px close=%px read=%px llseek=%px\n",
+                reason ?: "(null)", filp_open_fn, filp_close_fn,
+                kernel_read_fn, vfs_llseek_fn);
+        return false;
+    }
+
+    filp = filp_open_fn(path, O_RDONLY, 0);
+    if (!filp || IS_ERR(filp)) {
+        WRITE_ONCE(g_policy_error, filp ? PTR_ERR(filp) : -ENOENT);
+        pr_warn("[selinux_hook] CLEAN Magisk policy open failed reason=%s source=%s path=%s rc=%ld\n",
+                reason ?: "(null)", source ?: "unknown", path,
+                filp ? PTR_ERR(filp) : -ENOENT);
+        return false;
+    }
+
+    len = vfs_llseek_fn(filp, 0, SEEK_END);
+    if (len <= 0 || len > MAGISK_POLICY_MAX_SIZE) {
+        WRITE_ONCE(g_policy_error, -EINVAL);
+        pr_warn("[selinux_hook] CLEAN Magisk policy bad len reason=%s source=%s path=%s len=%lld\n",
+                reason ?: "(null)", source ?: "unknown", path, len);
+        filp_close_fn(filp, 0);
+        return false;
+    }
+    vfs_llseek_fn(filp, 0, SEEK_SET);
+
+    data = vmalloc_fn((unsigned long)len);
+    if (!data) {
+        pr_warn("[selinux_hook] CLEAN Magisk policy alloc failed reason=%s source=%s len=%lld\n",
+                reason ?: "(null)", source ?: "unknown", len);
+        filp_close_fn(filp, 0);
+        return false;
+    }
+
+    pos = 0;
+    nread = call_kernel_read_file(filp, data, (size_t)len, &pos);
+    filp_close_fn(filp, 0);
+    if (nread != len || pos != len) {
+        WRITE_ONCE(g_policy_error, nread < 0 ? (int)nread : -EIO);
+        pr_warn("[selinux_hook] CLEAN Magisk policy read failed reason=%s source=%s read=%ld pos=%lld len=%lld\n",
+                reason ?: "(null)", source ?: "unknown", (long)nread, pos, len);
+        if (vfree_fn)
+            vfree_fn(data);
+        return false;
+    }
+
+    WRITE_ONCE(g_clean_policy_has_magisk, buffer_contains_magisk(data, (size_t)len));
+    WRITE_ONCE(g_clean_policy_len, (size_t)len);
+    WRITE_ONCE(g_clean_policy_blob, data);
+    pr_info("[selinux_hook] CLEAN Magisk policy snapshot saved reason=%s source=%s path=%s blob=%px len=%zu has_magisk=%d\n",
+            reason ?: "(null)", source ?: "unknown", path, data,
+            READ_ONCE(g_clean_policy_len), READ_ONCE(g_clean_policy_has_magisk));
+    return true;
+}
+
+static bool snapshot_magisk_policy_file(const char *reason, bool try_relative)
+{
+    if (snapshot_policy_file_path(MAGISK_POLICY_PATH, "magisk_file_abs", reason))
+        return true;
+    if (try_relative &&
+        snapshot_policy_file_path(MAGISK_POLICY_REL_PATH, "magisk_file_rel", reason))
+        return true;
+    return false;
+}
+
+static void try_load_clean_policydb_from_blob(const char *reason)
+{
+    struct policy_file fp;
+    struct policydb *policydb;
+    void *blob = READ_ONCE(g_clean_policy_blob);
+    size_t len = READ_ONCE(g_clean_policy_len);
+    int rc;
+
+    if (READ_ONCE(g_clean_policydb))
+        return;
+    if (!blob || !len)
+        return;
+    if (!policydb_read_fn || !policydb_destroy_fn || !vmalloc_fn)
+        return;
+
+    policydb = (struct policydb *)vmalloc_fn(CLEAN_POLICYDB_ALLOC_SIZE);
+    if (!policydb) {
+        pr_warn("[selinux_hook] CLEAN policydb_read alloc failed reason=%s size=%u\n",
+                reason ?: "(null)", CLEAN_POLICYDB_ALLOC_SIZE);
+        return;
+    }
+    zero_bytes(policydb, CLEAN_POLICYDB_ALLOC_SIZE);
+
+    fp.data = (char *)blob;
+    fp.len = len;
+    rc = policydb_read_fn(policydb, &fp);
+    if (rc) {
+        WRITE_ONCE(g_policy_error, rc);
+        pr_warn("[selinux_hook] CLEAN policydb_read failed reason=%s rc=%d policydb=%px blob=%px len=%zu\n",
+                reason ?: "(null)", rc, policydb, blob, len);
+        if (policydb_destroy_fn)
+            policydb_destroy_fn(policydb);
+        if (vfree_fn)
+            vfree_fn(policydb);
+        return;
+    }
+
+    WRITE_ONCE(g_policy_error, 0);
+    WRITE_ONCE(g_clean_policydb, policydb);
+    WRITE_ONCE(g_clean_policydb_direct, true);
+    pr_info("[selinux_hook] CLEAN policydb_read saved reason=%s policydb=%px blob=%px len=%zu alloc=%u\n",
+            reason ?: "(null)", policydb, blob, len, CLEAN_POLICYDB_ALLOC_SIZE);
+}
+
+static void activate_clean_policy_blob(const char *reason)
+{
+    if (READ_ONCE(g_clean_policy_blob) && READ_ONCE(g_clean_policy_len))
+        try_load_clean_policydb_from_blob(reason);
+}
+
+static void snapshot_clean_policy(const char *reason)
+{
+    if (READ_ONCE(g_clean_policy_blob))
+        return;
+    if (READ_ONCE(g_dirty_policy_seen))
+        return;
+
+    if (!snapshot_magisk_policy_file(reason, true))
+        return;
+
+    activate_clean_policy_blob(reason);
+}
+
+static bool finish_deferred_policy_capture(hook_fargs4_t *a, const char *stage,
+                                           bool allow_fallback)
+{
+    void *data = NULL;
+    size_t len = 0;
+
+    if (READ_ONCE(g_clean_policy_blob))
+        return true;
+    if (READ_ONCE(g_dirty_policy_seen))
+        return false;
+
+    if (snapshot_magisk_policy_file(stage, true)) {
+        activate_clean_policy_blob(stage);
+        return READ_ONCE(g_clean_policy_blob) != NULL;
+    }
+
+    if (!allow_fallback) {
+        selinux_hook_dbg("[selinux_hook] CLEAN Magisk policy unavailable during %s; waiting for after security_load_policy\n",
+                         stage ?: "before");
+        return false;
+    }
+
+    if (!a)
+        return false;
+
+    if (selinux_compat_call_needed()) {
+        data = (void *)a->arg1;
+        len = (size_t)a->arg2;
+    } else {
+        data = (void *)a->arg0;
+        len = (size_t)a->arg1;
+		if (len > MAGISK_POLICY_MAX_SIZE || !len || !data)
+		{
+			/* Some devices use stateful layouts but do not export the `selinux_state` symbol; 
+			 * this execution branch is intended to address this situation. */
+			data = (void *)a->arg1;
+			len = (size_t)a->arg2;
+		}
+    }
+
+    if (!data || !len || len > MAGISK_POLICY_MAX_SIZE || !vmalloc_fn) {
+        WRITE_ONCE(g_policy_error, -EINVAL);
+        pr_warn("[selinux_hook] CLEAN security_load_policy fallback rejected stage=%s data=%px len=%zu vmalloc=%px\n",
+                stage ?: "after", data, len, vmalloc_fn);
+        return false;
+    }
+
+    {
+        void *src = data;
+        void *copy = vmalloc_fn((unsigned long)len);
+
+        if (!copy) {
+            pr_warn("[selinux_hook] CLEAN security_load_policy fallback alloc failed stage=%s len=%zu\n",
+                    stage ?: "after", len);
+            return false;
+        }
+        if (!copy_from_kernel_nofault_fn ||
+            copy_from_kernel_nofault_fn(copy, src, len)) {
+            WRITE_ONCE(g_policy_error, -EFAULT);
+            if (vfree_fn)
+                vfree_fn(copy);
+            pr_warn("[selinux_hook] policy capture rejected unreadable load buffer\n");
+            return false;
+        }
+        data = copy;
+    }
+    if (!data) {
+        pr_warn("[selinux_hook] CLEAN security_load_policy fallback alloc failed stage=%s len=%zu\n",
+                stage ?: "after", len);
+        return false;
+    }
+
+    WRITE_ONCE(g_clean_policy_has_magisk, buffer_contains_magisk(data, len));
+    WRITE_ONCE(g_clean_policy_len, len);
+    WRITE_ONCE(g_clean_policy_blob, data);
+    pr_warn("[selinux_hook] CLEAN policy captured from security_load_policy args stage=%s blob=%px len=%zu has_magisk=%d\n",
+            stage ?: "after", data, len, READ_ONCE(g_clean_policy_has_magisk));
+    activate_clean_policy_blob(stage ?: "security_load_policy");
+    return true;
+}
+
+static void before_security_load_policy(hook_fargs4_t *a, void *u)
+{
+    if (READ_ONCE(g_clean_policy_blob) || g_policy_capture_in_progress)
+        return;
+
+    g_policy_capture_in_progress = true;
+    finish_deferred_policy_capture(a, "before_security_load_policy", false);
+    g_policy_capture_in_progress = false;
+}
+
+static void after_security_load_policy(hook_fargs4_t *a, void *u)
+{
+    if (READ_ONCE(g_clean_policy_blob) || g_policy_capture_in_progress)
+        return;
+    if (a && (long)a->ret)
+        return;
+
+    g_policy_capture_in_progress = true;
+    finish_deferred_policy_capture(a, "after_security_load_policy", true);
+    g_policy_capture_in_progress = false;
+}
+
+static bool contains_magisk(const char *s, size_t len)
+{
+    return contains_case_literal(s, len, "magisk");
+}
+
+static bool contains_case_lit(const char *s, size_t len, const char *lit, size_t lit_len)
+{
+    size_t i;
+    size_t j;
+
+    if (!s || !lit || !lit_len || len < lit_len)
+        return false;
+
+    for (i = 0; i + lit_len <= len; i++) {
+        for (j = 0; j < lit_len; j++) {
+            if (!ascii_lower_eq(s[i + j], lit[j]))
+                break;
+        }
+        if (j == lit_len)
+            return true;
+    }
+
+    return false;
+}
+
+static size_t sanitize_query_sample(char *dst, size_t size)
+{
+    size_t i;
+
+    if (!dst)
+        return 0;
+
+    for (i = 0; i < size && i < ACCESS_SAMPLE_MAX - 1; i++) {
+        char c = dst[i];
+
+        if (!c)
+            break;
+        if (c == '\n' || c == '\r' || c == '\t')
+            c = ' ';
+        dst[i] = c;
+    }
+
+    dst[i] = '\0';
+    return i;
+}
+
+static size_t copy_query_sample(char *dst, const char *src, size_t size)
+{
+    size_t limit;
+    long copied;
+
+    if (!dst || !src)
+        return 0;
+
+    limit = size;
+    if (!limit || limit > ACCESS_SAMPLE_MAX - 1)
+        limit = ACCESS_SAMPLE_MAX - 1;
+
+    dst[0] = '\0';
+
+    if (copy_from_kernel_nofault_fn &&
+        copy_from_kernel_nofault_fn(dst, src, limit) == 0) {
+        dst[limit] = '\0';
+        return sanitize_query_sample(dst, limit);
+    }
+
+    copied = compat_strncpy_from_user(dst, (const char __user *)src, limit + 1);
+    if (copied <= 0) {
+        dst[0] = '\0';
+        return 0;
+    }
+
+    if ((size_t)copied > limit)
+        copied = limit;
+    return sanitize_query_sample(dst, (size_t)copied);
+}
+
+static bool enter_clean_eval_scope(void)
+{
+    void *task = current;
+    int empty = -1;
+    int i;
+    u32 depth;
+    bool entered = false;
+
+    if (!clean_policydb_redirect_supported())
+        return false;
+    if (!READ_ONCE(g_clean_policydb))
+        return false;
+
+    if (g_raw_spin_lock_fn)
+        g_raw_spin_lock_fn(&g_scopes_lock);
+    for (i = 0; i < CLEAN_EVAL_SCOPE_SLOTS; i++) {
+        if (g_clean_eval_scopes[i].task == task) {
+            depth = g_clean_eval_scopes[i].depth + 1;
+            g_clean_eval_scopes[i].depth = depth;
+            WRITE_ONCE(g_clean_eval_depth, READ_ONCE(g_clean_eval_depth) + 1);
+            entered = true;
+            break;
+        }
+        if (empty < 0 && !g_clean_eval_scopes[i].task)
+            empty = i;
+    }
+
+    if (!entered) {
+        if (empty < 0) {
+            if (g_raw_spin_unlock_fn)
+        g_raw_spin_unlock_fn(&g_scopes_lock);
+            pr_warn("[selinux_hook] clean eval scope slots exhausted task=%px comm=%s\n",
+                    task, current_comm());
+            return false;
+        }
+        g_clean_eval_scopes[empty].task = task;
+        g_clean_eval_scopes[empty].depth = 1;
+        WRITE_ONCE(g_clean_eval_depth, READ_ONCE(g_clean_eval_depth) + 1);
+        entered = true;
+    }
+    if (g_raw_spin_unlock_fn)
+        g_raw_spin_unlock_fn(&g_scopes_lock);
+    return true;
+}
+
+static void leave_clean_eval_scope(void)
+{
+    void *task = current;
+    int i;
+    u32 depth;
+
+    if (g_raw_spin_lock_fn)
+        g_raw_spin_lock_fn(&g_scopes_lock);
+    for (i = 0; i < CLEAN_EVAL_SCOPE_SLOTS; i++) {
+        if (g_clean_eval_scopes[i].task != task)
+            continue;
+
+        depth = g_clean_eval_scopes[i].depth;
+        if (depth > 1) {
+            g_clean_eval_scopes[i].depth = depth - 1;
+        } else {
+            g_clean_eval_scopes[i].depth = 0;
+            g_clean_eval_scopes[i].task = NULL;
+        }
+        if (READ_ONCE(g_clean_eval_depth))
+            WRITE_ONCE(g_clean_eval_depth, READ_ONCE(g_clean_eval_depth) - 1);
+        if (g_raw_spin_unlock_fn)
+        g_raw_spin_unlock_fn(&g_scopes_lock);
+        return;
+    }
+    if (g_raw_spin_unlock_fn)
+        g_raw_spin_unlock_fn(&g_scopes_lock);
+}
+
+static bool current_in_clean_eval_scope(void)
+{
+    void *task = current;
+    int i;
+    bool in_scope = false;
+
+    if (g_raw_spin_lock_fn)
+        g_raw_spin_lock_fn(&g_scopes_lock);
+    for (i = 0; i < CLEAN_EVAL_SCOPE_SLOTS; i++) {
+        if (g_clean_eval_scopes[i].task == task &&
+            g_clean_eval_scopes[i].depth) {
+            in_scope = true;
+            break;
+        }
+    }
+    if (g_raw_spin_unlock_fn)
+        g_raw_spin_unlock_fn(&g_scopes_lock);
+    return in_scope;
+}
+
+/* Hook: selinux_complete_init */
+static void after_selinux_complete_init(hook_fargs0_t *a, void *u)
+{
+    WRITE_ONCE(g_selinux_ready, true);
+    selinux_hook_dbg("[selinux_hook] SELinux complete_init done\n");
+    snapshot_clean_policy("complete_init");
+}
+
+/* Hook: selinux_policy_commit */
+static void after_selinux_policy_commit(hook_fargs2_t *a, void *u)
+{
+    WRITE_ONCE(g_selinux_ready, true);
+    selinux_hook_dbg("[selinux_hook] SELinux policy committed, first policydb=%px clean policydb=%px\n",
+                     g_first_policydb, READ_ONCE(g_clean_policydb));
+    snapshot_clean_policy("policy_commit");
+}
+
+static void before_policydb_arg0(hook_fargs6_t *a, void *u)
+{
+    void *policydb = (void *)a->arg0;
+    void *clean_policydb = READ_ONCE(g_clean_policydb);
+    bool bypass = should_bypass_clean_filter(current_uid());
+
+    if (!clean_policydb_redirect_supported())
+        return;
+
+    if (bypass)
+        return;
+
+    /*
+     * Only calls running in an explicit clean-eval scope may redirect policydb
+     * input.  The scope is tied to current so unrelated callers on other tasks
+     * remain observational and keep using the live policydb.
+     */
+    if (current_in_clean_eval_scope() && clean_policydb) {
+        a->arg0 = (uint64_t)clean_policydb;
+        return;
+    }
+
+    if (!policydb)
+        return;
+
+    if (!READ_ONCE(g_selinux_ready)) {
+        WRITE_ONCE(g_selinux_ready, true);
+        selinux_hook_dbg("[selinux_hook] SELinux ready inferred from context_struct_compute_av\n");
+    }
+
+    if (!READ_ONCE(g_first_policydb)) {
+        WRITE_ONCE(g_first_policydb, policydb);
+        selinux_hook_dbg("[selinux_hook] SAVED first policydb @ %px\n", g_first_policydb);
+        snapshot_clean_policy("first_compute_av");
+        return;
+    }
+
+    if (!READ_ONCE(g_dirty_policy_seen) &&
+        policydb != READ_ONCE(g_first_policydb) &&
+        policydb != READ_ONCE(g_clean_policydb)) {
+        WRITE_ONCE(g_dirty_policy_seen, true);
+        selinux_hook_dbg("[selinux_hook] policydb changed %px -> %px, Magisk access probes will hit clean-policy EINVAL\n",
+                         g_first_policydb, policydb);
+    }
+}
+
+/* Hook: /sys/fs/selinux/access write handler */
+static void before_sel_write_access(hook_fargs4_t *a, void *u)
+{
+    // if (current_uid() < 10000 || current_is_policy_manager()) {
+    //     return; 
+    // }
+    // pr_info("[selinux_hook] before_sel_write_access called uid=%u\n", current_uid());
+    const char *query = (const char *)a->arg1;
+    size_t size = (size_t)a->arg2;
+    char sample[ACCESS_SAMPLE_MAX];
+    u32 slot;
+    u32 n;
+    uid_t uid;
+
+    a->local.data0 = 0;
+
+    uid = current_uid();
+    copy_query_sample(sample, query, size);
+
+    if (should_bypass_clean_filter(uid))
+        return;
+
+    n = READ_ONCE(g_clean_access_count) + 1;
+    WRITE_ONCE(g_clean_access_count, n);
+
+    /* Run the original selinuxfs write handler under the current task's clean scope. */
+    a->local.data0 = 3;
+    a->local.data1 = n;
+    slot = n & (ACCESS_PROBE_SLOTS - 1);
+    a->local.data2 = slot;
+    g_probes[slot].id = n;
+    g_probes[slot].uid = uid;
+    g_probes[slot].node = "access";
+    copy_bytes(g_probes[slot].query, sample, ACCESS_SAMPLE_MAX);
+    if (enter_clean_eval_scope()) {
+        a->local.data3 = 1;
+    } else {
+        a->local.data0 = 0;
+    }
+}
+
+/* Hook: /sys/fs/selinux/context write handler */
+static void before_sel_write_context(hook_fargs4_t *a, void *u)
+{
+    const char *query = (const char *)a->arg1;
+    size_t size = (size_t)a->arg2;
+    char sample[ACCESS_SAMPLE_MAX];
+    u32 slot;
+    u32 n;
+    uid_t uid;
+
+    a->local.data0 = 0;
+
+    uid = current_uid();
+    copy_query_sample(sample, query, size);
+
+    if (should_bypass_clean_filter(uid))
+        return;
+
+    n = READ_ONCE(g_clean_access_count) + 1;
+    WRITE_ONCE(g_clean_access_count, n);
+
+    a->local.data1 = n;
+    slot = n & (ACCESS_PROBE_SLOTS - 1);
+    a->local.data2 = slot;
+    g_probes[slot].id = n;
+    g_probes[slot].uid = uid;
+    g_probes[slot].node = "context";
+    copy_bytes(g_probes[slot].query, sample, ACCESS_SAMPLE_MAX);
+
+    a->local.data0 = 3;
+    if (enter_clean_eval_scope()) {
+        a->local.data3 = 1;
+    } else {
+        a->local.data0 = 0;
+    }
+}
+
+static void after_sel_write_common(hook_fargs4_t *a, void *u)
+{
+    long live_ret;
+    struct access_probe *probe;
+    u32 id;
+    u32 slot;
+
+    if (!a->local.data0)
+        return;
+
+    id = (u32)a->local.data1;
+    slot = (u32)a->local.data2;
+    if (a->local.data3)
+        leave_clean_eval_scope();
+
+    probe = &g_probes[slot];
+    if (probe->id != id)
+        return;
+
+    live_ret = (long)a->ret;
+
+    /* Patch seqno in the access response buffer to match /sys/fs/selinux/status */
+    if (live_ret > 0 && probe->node && probe->node[0] == 'a') {
+        char *rbuf = (char *)a->arg1;
+        ssize_t new_ret = patch_response_seqno(rbuf, live_ret, KP_AVD_CLEAN_SEQNO);
+        if (new_ret > 0) {
+            live_ret = new_ret;
+            a->ret = (uint64_t)new_ret;
+        }
+    }
+
+    selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/%s #%u uid=%d comm=%s clean_ret=%ld clean_policydb=%px blob=%px len=%zu query=\"%s\"\n",
+                     probe->node ?: "?", id, probe->uid, current_comm(), live_ret,
+                     READ_ONCE(g_clean_policydb), READ_ONCE(g_clean_policy_blob),
+                     READ_ONCE(g_clean_policy_len), probe->query);
+}
+
+static int install_write_op_hooks(void)
+{
+    unsigned long addr_access, addr_context;
+    hook_err_t hook_err;
+
+    if (!clean_policydb_redirect_supported())
+        return -EOPNOTSUPP;
+
+    /* Direct symbols are required; no pointer-table fallback is available. */
+    addr_access = (unsigned long)lookup_name_optional_suffix("sel_write_access");
+    addr_context = (unsigned long)lookup_name_optional_suffix("sel_write_context");
+    log_symbol_addr("sel_write_access", (void *)addr_access);
+    log_symbol_addr("sel_write_context", (void *)addr_context);
+
+    if (!addr_access || !addr_context) {
+        pr_warn("[selinux_hook] sel_write_access unresolved; direct access/context hooks unavailable\n");
+        return -EOPNOTSUPP;
+    }
+
+    if (g_hooks + (addr_context ? 2 : 1) >
+        (int)(sizeof(g_funcs) / sizeof(g_funcs[0])))
+        return -ENOSPC;
+
+    pr_info("[selinux_hook] hook sel_write_access argc=3 mode=direct\n");
+    hook_err = hook_wrap((void *)addr_access, 3, before_sel_write_access,
+                         after_sel_write_common, NULL);
+    if (hook_err != HOOK_NO_ERR) {
+        pr_err("[selinux_hook] hook sel_write_access failed err=%d\n",
+               (int)hook_err);
+        return (int)hook_err;
+    }
+    record_inline_hook((void *)addr_access, before_sel_write_access,
+                       after_sel_write_common);
+    selinux_hook_dbg("[selinux_hook] inline hook sel_write_access @ %lx\n", addr_access);
+
+    if (addr_context) {
+        pr_info("[selinux_hook] hook sel_write_context argc=3 mode=direct\n");
+        hook_err = hook_wrap((void *)addr_context, 3,
+                             before_sel_write_context,
+                             after_sel_write_common, NULL);
+        if (hook_err != HOOK_NO_ERR) {
+            pr_err("[selinux_hook] hook sel_write_context failed err=%d\n",
+                   (int)hook_err);
+            hook_unwrap((void *)addr_access, before_sel_write_access,
+                        after_sel_write_common);
+            g_hooks--;
+            g_funcs[g_hooks] = NULL;
+            g_hook_befores[g_hooks] = NULL;
+            g_hook_afters[g_hooks] = NULL;
+            return (int)hook_err;
+        }
+        record_inline_hook((void *)addr_context, before_sel_write_context,
+                           after_sel_write_common);
+        selinux_hook_dbg("[selinux_hook] inline hook sel_write_context @ %lx\n", addr_context);
+    } else {
+        pr_warn("[selinux_hook] sel_write_context not found, context hook skipped\n");
+    }
+    return 0;
+}
+
+static void record_inline_hook(void *func, void *before, void *after)
+{
+    g_funcs[g_hooks] = func;
+    g_hook_befores[g_hooks] = before;
+    g_hook_afters[g_hooks] = after;
+    g_hooks++;
+}
+
+static int install_checked_hook(void *func, int argc, void *before, void *after)
+{
+    hook_err_t err;
+    if (!func || g_hooks >= (int)(sizeof(g_funcs) / sizeof(g_funcs[0])))
+        return -EINVAL;
+    err = hook_wrap(func, argc, before, after, NULL);
+    if (err != HOOK_NO_ERR) {
+        pr_err("[selinux_hook] hook failed target=%px argc=%d err=%d\n", func, argc, (int)err);
+        return -EINVAL;
+    }
+    record_inline_hook(func, before, after);
+    return 0;
+}
+
+static void uninstall_inline_hooks(void)
+{
+    int i;
+
+    for (i = 0; i < g_hooks; i++)
+        hook_unwrap(g_funcs[i], g_hook_befores[i], g_hook_afters[i]);
+    g_hooks = 0;
+}
+
+/* Hook: selinux_setprocattr(name, value, size) clean-policy wrapper */
+static void before_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
+{
+    const char *name = (const char *)a->arg0;
+    uid_t uid = current_uid();
+    u32 n;
+
+    a->local.data0 = 0;
+
+    n = READ_ONCE(g_selinux_setprocattr_probe_count);
+    if (n < 16) {
+        n++;
+        WRITE_ONCE(g_selinux_setprocattr_probe_count, n);
+        pr_info("[selinux_hook] PROBE selinux_setprocattr #%u uid=%d comm=%s arg0=%px arg1=%px arg2=%zu\n",
+                n, current_uid(), current_comm(), (void *)a->arg0,
+                (void *)a->arg1, (size_t)a->arg2);
+    }
+
+    if (should_bypass_clean_filter(uid) || !str_eq_lit(name, "current"))
+        return;
+
+    if (enter_clean_eval_scope())
+        a->local.data0 = 1;
+}
+
+static void after_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
+{
+    if (a->local.data0)
+        leave_clean_eval_scope();
+}
+
+/* The target inlines the page factory into open; redirect the successful
+ * open result so read and mmap share the same retained backing page. */
+static void after_sel_open_handle_status(hook_fargs2_t *a, void *u)
+{
+    void *page;
+    if ((long)a->ret || should_bypass_clean_filter(current_uid()) || !a->arg1)
+        return;
+    page = vmalloc_to_page_fn(g_fake_status_page);
+    if (page)
+        WRITE_ONCE(*(void **)(a->arg1 + struct_offset.file_private_data), page);
+}
+
+/* Accept only the offline-checked target's read/mmap prefixes and open
+ * store.  A symbol name alone does not prove a private-field layout. */
+static bool validate_status_layout(void)
+{
+    u32 read_code[4], mmap_code[4], open_code[20];
+    if (runtime_page_size() != 4096)
+        return false;
+    void *read = lookup_name_optional_suffix("sel_read_handle_status");
+    void *mmap = lookup_name_optional_suffix("sel_mmap_handle_status");
+    g_status_open = lookup_name_optional_suffix("sel_open_handle_status");
+    if (!read || !mmap || !g_status_open || !copy_from_kernel_nofault_fn)
+        return false;
+    if (copy_from_kernel_nofault_fn(read_code, read, sizeof(read_code)) ||
+        copy_from_kernel_nofault_fn(mmap_code, mmap, sizeof(mmap_code)) ||
+        copy_from_kernel_nofault_fn(open_code, g_status_open, sizeof(open_code)))
+        return false;
+    /* file is x0 at read/mmap entry, x1 saved as x19 at open entry. */
+    if (read_code[0] != 0xa9bf7bfd || read_code[1] != 0x910003fd ||
+        mmap_code[0] != read_code[0] || mmap_code[1] != read_code[1] ||
+        open_code[5] != 0xaa0103f3 || open_code[18] != 0xf9006675 ||
+        read_code[2] != 0xf9406408 || mmap_code[2] != 0xf9406409)
+        return false;
+#ifndef CONFIG_KPM_BASELINES
+    struct_offset.file_private_data = ((read_code[2] >> 10) & 0xfff) * 8;
+#endif
+    return struct_offset.file_private_data == 0xc8;
+}
+
+static bool install_status_page_redirect(void)
+{
+    unsigned long addr;
+    hook_err_t err;
+    void *page;
+    size_t fake_page_size = runtime_page_size();
+
+    if (READ_ONCE(g_status_open_redirect_hooked))
+        return true;
+
+    if (!vmalloc_fn || !vmalloc_to_page_fn) {
+        pr_warn("[selinux_hook] status page redirect unavailable vmalloc=%px vmalloc_to_page=%px\n",
+                vmalloc_fn, vmalloc_to_page_fn);
+        return false;
+    }
+
+    if (!g_fake_status_page) {
+        g_fake_status_page = vmalloc_fn(fake_page_size);
+        if (!g_fake_status_page) {
+            pr_warn("[selinux_hook] fake status page allocation failed size=%zu\n",
+                    fake_page_size);
+            return false;
+        }
+        zero_bytes(g_fake_status_page, fake_page_size);
+        copy_bytes(g_fake_status_page, g_clean_status_bytes,
+                   sizeof(g_clean_status_bytes));
+    }
+
+    page = vmalloc_to_page_fn(g_fake_status_page);
+    if (!page) {
+        pr_warn("[selinux_hook] cannot translate fake status page to struct page\n");
+        return false;
+    }
+
+    if (!validate_status_layout()) {
+        pr_err("[selinux_hook] status layout not covered; refusing private_data write\n");
+        return false;
+    }
+    addr = (unsigned long)g_status_open;
+    err = hook_wrap((void *)addr, 2, NULL, after_sel_open_handle_status, NULL);
+    if (err != HOOK_NO_ERR) {
+        pr_err("[selinux_hook] status open hook failed err=%d\n", (int)err);
+        return false;
+    }
+    record_inline_hook((void *)addr, NULL, after_sel_open_handle_status);
+    WRITE_ONCE(g_status_open_redirect_hooked, true);
+    pr_info("[selinux_hook] status open installed private_data=+0x%x\n",
+            struct_offset.file_private_data);
+    return true;
+}
+
+static long init(const char *args, const char *event, void *__user r)
+{
+    unsigned long addr;
+    int rc;
+
+    selinux_hook_dbg("[selinux_hook] init event=%s\n", event ?: "(null)");
+
+    /* Initialize clean status bytes based on kernel version */
+    fill_clean_status_bytes(g_clean_status_bytes);
+    selinux_hook_dbg("[selinux_hook] clean status: kver=%u.%u seq=%u pload=%u\n",
+                     (unsigned)(kver >> 16), (unsigned)((kver >> 8) & 0xff),
+                     get_u32_le(g_clean_status_bytes + 4),
+                     get_u32_le(g_clean_status_bytes + 12));
+    pr_info("[selinux_hook] kernel kver=%x legacy_blob_abi=%d\n",
+            kver, use_legacy_clean_blob_query() ? 1 : 0);
+    resolve_required_symbols_once();
+
+    /* Scope arrays are shared by tasks; both raw lock helpers are required. */
+    g_raw_spin_lock_fn = (raw_spin_lock_fn_t)lookup_name_optional_suffix("_raw_spin_lock");
+    g_raw_spin_unlock_fn = (raw_spin_unlock_fn_t)lookup_name_optional_suffix("_raw_spin_unlock");
+    if (!g_raw_spin_lock_fn || !g_raw_spin_unlock_fn) {
+        pr_err("[selinux_hook] scope locking unavailable\n");
+        return -ENOENT;
+    }
+
+    copy_from_kernel_nofault_fn = (void *)lookup_name_optional_suffix("copy_from_kernel_nofault");
+    if (!copy_from_kernel_nofault_fn)
+        copy_from_kernel_nofault_fn = (void *)lookup_name_optional_suffix("probe_kernel_read");
+    vmalloc_fn = (void *)lookup_name_optional_suffix("vmalloc");
+    if (!vmalloc_fn)
+        vmalloc_fn = (void *)lookup_name_optional_suffix("vmalloc_noprof");
+    vmalloc_to_page_fn = (void *)lookup_name_optional_suffix("vmalloc_to_page");
+    vfree_fn = (void *)lookup_name_optional_suffix("vfree");
+    filp_open_fn = (void *)lookup_name_optional_suffix("filp_open");
+    filp_close_fn = (void *)lookup_name_optional_suffix("filp_close");
+    kernel_read_fn = (void *)lookup_name_optional_suffix("kernel_read");
+    vfs_llseek_fn = (void *)lookup_name_optional_suffix("vfs_llseek");
+    g_selinux_state = lookup_name_optional_suffix("selinux_state");
+    if (!filp_open_fn || !filp_close_fn || !kernel_read_fn || !vfs_llseek_fn)
+        pr_warn("[selinux_hook] cannot find file-read symbols: filp_open=%px filp_close=%px kernel_read=%px vfs_llseek=%px\n",
+                filp_open_fn, filp_close_fn, kernel_read_fn, vfs_llseek_fn);
+    security_load_policy_fn = (void *)lookup_name_optional_suffix("security_load_policy");
+    security_context_to_sid_fn = (void *)lookup_name_optional_suffix("security_context_to_sid");
+    security_context_to_sid_compat_fn = (void *)security_context_to_sid_fn;
+    policydb_read_fn = (void *)lookup_name_optional_suffix("policydb_read");
+    policydb_destroy_fn = (void *)lookup_name_optional_suffix("policydb_destroy");
+    log_symbol_addr("selinux_state", g_selinux_state);
+    log_symbol_addr("security_context_to_sid", (void *)security_context_to_sid_fn);
+    log_symbol_addr("security_load_policy", (void *)security_load_policy_fn);
+    log_symbol_addr("policydb_read", (void *)policydb_read_fn);
+    log_symbol_addr("policydb_destroy", (void *)policydb_destroy_fn);
+    pr_info("[selinux_hook] compat route: state_calls=%d policydb_redirect=%d\n",
+            selinux_compat_call_needed() ? 1 : 0,
+            clean_policydb_redirect_supported() ? 1 : 0);
+    if (selinux_compat_call_needed())
+        pr_info("[selinux_hook] SELinux compat calls enabled kver=%x state=%px\n",
+                kver, g_selinux_state);
+    /* Keep the clean policy snapshot available to redirect-capable hooks. */
+    snapshot_clean_policy("module_init");
+    if (!security_context_to_sid_fn)
+        pr_warn("[selinux_hook] cannot find security_context_to_sid, procattr clean-policy redirect unavailable\n");
+    if (!policydb_read_fn || !policydb_destroy_fn)
+        pr_warn("[selinux_hook] cannot find policydb_read/policydb_destroy, clean policydb redirect disabled\n");
+    bool status_page_redirect = false;
+    status_page_redirect = install_status_page_redirect();
+    if (status_page_redirect) pr_info("[selinux_hook] status page redirect successfully\n");
+    else pr_warn("[selinux_hook] status page redirect failed\n");
+    /* On failure, leave the kernel's native status mmap path untouched. */
+
+    if (!security_load_policy_fn) {
+        pr_warn("[selinux_hook] cannot find security_load_policy, deferred clean policy capture disabled\n");
+    } else if (!READ_ONCE(g_clean_policy_blob)) {
+        int argc = selinux_compat_call_needed() ? 4 : 3;
+
+        rc = install_checked_hook((void *)security_load_policy_fn, argc,
+                                  before_security_load_policy, after_security_load_policy);
+        if (rc)
+            goto fail;
+    } else {
+        selinux_hook_dbg("[selinux_hook] security_load_policy capture skipped; clean policy already loaded\n");
+    }
+
+    if (clean_policydb_redirect_supported()) {
+        addr = (unsigned long)lookup_name_optional_suffix("selinux_setprocattr");
+        if (addr) {
+            rc = install_checked_hook((void *)addr, 3, before_selinux_setprocattr_clean_eval,
+                                      after_selinux_setprocattr_clean_eval);
+            if (rc)
+                goto fail;
+        } else {
+            pr_warn("[selinux_hook] cannot find selinux_setprocattr\n");
+        }
+    } else {
+        selinux_hook_dbg("[selinux_hook] skip selinux_setprocattr clean-eval; policydb redirect unsupported\n");
+    }
+
+    if (clean_policydb_redirect_supported()) {
+        rc = install_write_op_hooks();
+        g_queries_hooked = rc == 0;
+        if (rc == -EOPNOTSUPP) {
+            pr_warn("[selinux_hook] direct selinuxfs write hooks unavailable; continuing without access/context redirect\n");
+        } else if (rc) {
+            uninstall_inline_hooks();
+            return rc;
+        }
+    } else {
+        selinux_hook_dbg("[selinux_hook] skip /access and /context hooks; policydb redirect unsupported\n");
+    }
+
+    /* Policydb redirect hooks / policydb 重定向 hooks. */
+	addr = (unsigned long)lookup_name_optional_suffix("context_struct_compute_av");
+	if (!addr)
+		addr = (unsigned long)lookup_name_numbered_suffix("context_struct_compute_av");
+    if (addr && clean_policydb_redirect_supported()) {
+        rc = install_checked_hook((void *)addr, 6, before_policydb_arg0, NULL);
+        if (rc)
+            goto fail;
+        g_compute_hooked = true;
+    } else if (!addr) {
+        pr_warn("[selinux_hook] cannot find context_struct_compute_av\n");
+    } else {
+        selinux_hook_dbg("[selinux_hook] skip context_struct_compute_av; policydb redirect unsupported\n");
+    }
+
+    addr = (unsigned long)lookup_name_optional_suffix("string_to_context_struct");
+    if (addr) {
+        if (clean_policydb_redirect_supported()) {
+            rc = install_checked_hook((void *)addr, 5, before_policydb_arg0, NULL);
+            if (rc)
+                goto fail;
+            g_string_hooked = true;
+        }
+    } else {
+        pr_warn("[selinux_hook] cannot find string_to_context_struct\n");
+    }
+
+    addr = (unsigned long)lookup_name_optional_suffix("selinux_complete_init");
+    if (addr) {
+        rc = install_checked_hook((void *)addr, 0, NULL, after_selinux_complete_init);
+        if (rc)
+            goto fail;
+    } else {
+        pr_warn("[selinux_hook] cannot find selinux_complete_init\n");
+    }
+
+    addr = (unsigned long)lookup_name_optional_suffix("selinux_policy_commit");
+    if (addr) {
+        int argc = selinux_compat_call_needed() ? 2 : 1;
+
+        rc = install_checked_hook((void *)addr, argc, NULL, after_selinux_policy_commit);
+        if (rc)
+            goto fail;
+    } else {
+        pr_info("[selinux_hook] optional selinux_policy_commit absent\n");
+    }
+
+    pr_info("[selinux_hook] hooks=%d status_open=%d queries=%d compute=%d string=%d policy_ready=%d policy_error=%d\n",
+            g_hooks, g_status_open_redirect_hooked, g_queries_hooked,
+            g_compute_hooked, g_string_hooked, !!g_clean_policydb, g_policy_error);
+    if (!g_clean_policydb)
+        pr_warn("[selinux_hook] POLICYDB_REQ: waiting for first policy load; native policy queries remain active\n");
+    return 0;
+fail:
+    uninstall_inline_hooks();
+    return rc;
+}
+
+static long exit_(void *__user r)
+{
+    uninstall_inline_hooks();
+
+    /* Open files/VMAs can outlive the module.  Keep the published page alive
+     * until reboot; do not vfree a page still used by read or mmap. */
+    if (g_fake_status_page)
+        pr_warn("[selinux_hook] retaining status backing page until reboot\n");
+
+    g_policy_capture_in_progress = false;
+
+    if (READ_ONCE(g_clean_policydb_direct) && g_clean_policydb) {
+        if (policydb_destroy_fn)
+            policydb_destroy_fn((struct policydb *)g_clean_policydb);
+        if (vfree_fn)
+            vfree_fn(g_clean_policydb);
+        g_clean_policydb = NULL;
+        g_clean_policydb_direct = false;
+    }
+
+    if (g_clean_policy_blob) {
+        if (vfree_fn)
+            vfree_fn(g_clean_policy_blob);
+        g_clean_policy_blob = NULL;
+        g_clean_policy_len = 0;
+    }
+
+    selinux_hook_dbg("[selinux_hook] exited\n");
+    return 0;
+}
+
+static sel_hook_state_t module_get_working_mode(void) // Used to identify the working mode
+{
+    bool has_clean_policydb = READ_ONCE(g_clean_policydb) != NULL;
+
+    if (!clean_policydb_redirect_supported() || !g_queries_hooked ||
+        !g_compute_hooked || !g_string_hooked)
+        return SEL_HOOK_STATE_UNSUPORRT;
+    if (!has_clean_policydb)
+        return SEL_HOOK_STATE_POLICYDB_REQ;
+    if (!g_status_open_redirect_hooked)
+        return SEL_HOOK_STATE_UNSUPORRT;
+    return SEL_HOOK_STATE_NORMAL;
+}
+
+static int append_u32(char *dst, int pos, int cap, u32 value)
+{
+    char tmp[11];
+    int n = 0;
+    int i;
+    if (!dst || pos < 0 || pos >= cap)
+        return -EINVAL;
+    if (!value)
+        tmp[n++] = '0';
+    else
+        while (value && n < (int)sizeof(tmp)) {
+            tmp[n++] = (char)('0' + value % 10);
+            value /= 10;
+        }
+    if (pos + n >= cap)
+        return -EINVAL;
+    for (i = 0; i < n; i++)
+        dst[pos + i] = tmp[n - i - 1];
+    return pos + n;
+}
+
+static int append_status_field(char *dst, int pos, int cap, const char *name, u32 value)
+{
+    size_t i;
+    if (!dst || !name || pos < 0 || pos >= cap)
+        return -EINVAL;
+    for (i = 0; name[i]; i++) {
+        if (pos >= cap - 1)
+            return -EINVAL;
+        dst[pos++] = name[i];
+    }
+    if (pos >= cap - 1)
+        return -EINVAL;
+    dst[pos++] = '=';
+    return append_u32(dst, pos, cap, value);
+}
+
+static long control(const char* args, char* __user out_msg, int outlen)
+{
+    sel_hook_state_t state;
+    const char *state_str;
+    int copied;
+    size_t len;
+
+    if (!args || !out_msg || outlen <= 0)
+        return -EINVAL;
+
+    if (str_eq_lit(args, "status")) {
+        static const char *const names[] = {
+            "policy_ready", "policy_errno", "status_open", "queries", "compute", "string", "hooks"
+        };
+        u32 values[] = {
+            !!READ_ONCE(g_clean_policydb), (u32)(-READ_ONCE(g_policy_error)),
+            g_status_open_redirect_hooked, g_queries_hooked, g_compute_hooked, g_string_hooked, g_hooks
+        };
+        char message[256];
+        int count = 0;
+        size_t i;
+        for (i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+            if (i)
+                message[count++] = ' ';
+            count = append_status_field(message, count, sizeof(message), names[i], values[i]);
+            if (count < 0 || count >= (int)sizeof(message) - 1)
+                return -EINVAL;
+        }
+        if (outlen <= count)
+            return -EINVAL;
+        message[count] = '\0';
+        copied = compat_copy_to_user(out_msg, message, count + 1);
+        return copied == count + 1 ? 0 : -EFAULT;
+    }
+
+    if (str_eq_lit(args, "mode")) {
+        state = module_get_working_mode();
+        switch (state) {
+        case SEL_HOOK_STATE_NORMAL:
+            state_str = "NORMAL";
+            break;
+        case SEL_HOOK_STATE_POLICYDB_REQ:
+            state_str = "POLICYDB_REQ";
+            break;
+        case SEL_HOOK_STATE_UNSUPORRT:
+            state_str = "UNSUPORRT";
+            break;
+        default:
+            state_str = "UNKNOWN";
+            break;
+        }
+
+        len = str_len_safe(state_str);
+        if ((size_t)outlen < len + 1)
+            return -EINVAL;
+        copied = compat_copy_to_user(out_msg, state_str, (int)len + 1);
+        if (copied != (int)len + 1)
+            return -EFAULT;
+        
+        return 0;
+    }
+    
+    return -EINVAL;
+}
+
+KPM_INIT(init);
+KPM_CTL0(control);
+KPM_EXIT(exit_);

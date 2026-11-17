@@ -16,6 +16,7 @@ on:
       - "**/Makefile"
       - "**/archive"
       - "re_kernel_x/tools/**"
+      - "selinux_hook/tools/**"
       - "nomount/module/**"
       - "nomount/README.md"
       - "nomount/tools/**"
@@ -39,6 +40,7 @@ on:
       - "**/Makefile"
       - "**/archive"
       - "re_kernel_x/tools/**"
+      - "selinux_hook/tools/**"
       - "nomount/module/**"
       - "nomount/README.md"
       - "nomount/tools/**"
@@ -79,7 +81,15 @@ jobs:
       - name: Update system and install dependencies
         run: |
           sudo apt update -y
-          sudo apt install llvm -y
+          sudo apt install clang lld llvm python3-venv -y
+
+      - name: Prepare SELinux KPM checks
+        run: |
+          python3 -m venv "$RUNNER_TEMP/selinux-kpm-checks"
+          "$RUNNER_TEMP/selinux-kpm-checks/bin/python" -m pip install pyelftools capstone
+
+      - name: SELinux KPM host tests
+        run: python3 selinux_hook/tools/test_target.py
 
       - name: Artifact gate regression tests
         run: |
@@ -103,8 +113,17 @@ jobs:
               continue
             fi
             echo "build ${dir}"
-            printf "%s\n" "${dir%/}" >> target/modules.txt
-            if [ "${dir%/}" = "re_kernel_x" ] || [ "${dir%/}" = "re_kernel" ] || [ "${dir%/}" = "run_cmd_demo" ] || [ "${dir%/}" = "zram_zstd" ] || [ "${dir%/}" = "nomount" ]; then
+            # 门禁核对 KPM 注册名；该模块的目录名与注册名不同。
+            module="${dir%/}"
+            if [ "$module" = "selinux_hook" ]; then
+              module="selinux_MAF_fork"
+            fi
+            printf "%s\n" "$module" >> target/modules.txt
+            if [ "${dir%/}" = "selinux_hook" ]; then
+              make -C "${dir}" all CC="clang --target=aarch64-linux-gnu" LD=ld.lld
+              "$RUNNER_TEMP/selinux-kpm-checks/bin/python" selinux_hook/tools/check_artifact.py "${dir}"*.kpm
+              mv "${dir}"*.kpm "${dir}"*.kpm.json target
+            elif [ "${dir%/}" = "re_kernel_x" ] || [ "${dir%/}" = "re_kernel" ] || [ "${dir%/}" = "run_cmd_demo" ] || [ "${dir%/}" = "zram_zstd" ] || [ "${dir%/}" = "nomount" ]; then
               make -C "${dir}" all
               if grep -Eq '^debug[[:space:]]*:' "${dir}Makefile"; then
                 make -C "${dir}" debug
