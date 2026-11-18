@@ -8,3 +8,13 @@ static struct fgp_site sites[] = {
 #define FGP_LOADER_DELTA 0x15e10UL
 #define FGP_LOADER_SIZE 0x1a0
 #define FGP_LOADER_HASH 0x05ebc2e15093bdf2ULL
+/* 以下帧和撤销契约来自本次 KP 字节，先核验后使用；不按版本号猜测。 */
+#define FGP_TRANSIT4_DELTA (-0x3560L)
+#define FGP_TRANSIT4_SIZE 0x118
+#define FGP_TRANSIT4_HASH 0xd905df6f1739c80bULL
+#define FGP_TRANSIT_SAVED_LR_BACK 0x40
+#define FGP_CHAIN_TRANSIT_OFFSET 0x280
+#define FGP_WRAP_SIZE 0x31c
+#define FGP_WRAP_HASH 0x28cc4238f94780c0ULL
+#define FGP_UNWRAP_SIZE 0x188
+#define FGP_UNWRAP_HASH 0x4a0d3293bd67d619ULL
